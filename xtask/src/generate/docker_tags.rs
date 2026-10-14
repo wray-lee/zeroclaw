@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn broad_tag_carries_the_full_channel_set_without_the_kitchen_sink() {
+    fn broad_tag_flags_match_the_dist_broad_selection() {
         let s = render(&root()).unwrap();
         let v: toml::Value = toml::from_str(&s).unwrap();
         let broad = v["tags"]
@@ -236,20 +236,13 @@ mod tests {
             .iter()
             .find(|t| t["stem"].as_str() == Some("dist-broad"))
             .unwrap();
-        let rendered = broad["features"].as_str().unwrap();
-        for feature in
-            crate::generate::spec::resolve_feature_list(&root(), &Selection::DistBroad).unwrap()
-        {
-            assert!(
-                rendered.contains(&feature),
-                "dist-broad feature {feature} not rendered"
-            );
-        }
-        // The broad image exists for channels outside the lean standard
-        // distribution; Slack is the motivating case.
-        assert!(rendered.contains("channel-slack"));
-        // Still not the kitchen sink.
-        assert!(!rendered.contains("hardware"));
-        assert!(!rendered.contains("browser-native"));
+        // The publish workflow builds from `flags`, so compare the whole flag
+        // string against the selection, not `features` (human-readable only):
+        // a substring match on `features` would let `channel-wecom-ws` hide a
+        // missing `channel-wecom`.
+        assert_eq!(
+            broad["flags"].as_str().unwrap(),
+            spec::resolve_flags(&root(), &Selection::DistBroad).unwrap(),
+        );
     }
 }
