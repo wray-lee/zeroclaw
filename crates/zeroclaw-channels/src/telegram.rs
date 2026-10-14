@@ -38,6 +38,13 @@ const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
 /// notice is abandoned, not retried.
 const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Ceiling on one `remove_reaction` clear. The clear runs while the
+/// orchestrator still holds the conversation permit, and
+/// `build_channel_proxy_client` sets no request timeout, so this bounds both
+/// the wait for an in-flight acknowledgement and the clear request itself
+/// (including its error-body read). A stalled Telegram must not pin the turn.
+const REACTION_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
+
 static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"</?(?:redacted_)?think(?:ing)?>").expect("ORPHAN_THINK_TAG_RE must compile")
 });
@@ -1018,6 +1025,18 @@ pub struct TelegramChannel {
     /// [`VOICE_DROP_NOTICE_TIMEOUT`] in production; tests shrink it so a
     /// stalled-notice regression does not have to wait out the real ceiling.
     voice_drop_notice_timeout: Duration,
+    /// Bound on one `remove_reaction` clear. Always [`REACTION_CLEAR_TIMEOUT`]
+    /// in production; tests shrink it so a stalled-clear regression does not
+    /// have to wait out the real ceiling.
+    reaction_clear_timeout: Duration,
+    /// In-flight acknowledgement reactions keyed by `(chat_id, message_id)`.
+    ///
+    /// `try_add_ack_reaction_nonblocking` sends the real `setMessageReaction`
+    /// request in a detached task, so the orchestrator's `early_ack_task` -
+    /// which calls the no-op `add_reaction` - does not wait for it.
+    /// `remove_reaction` settles the entry for the message before clearing, so
+    /// the clear cannot overtake the ack and strand the emoji.
+    ack_reactions_in_flight: Mutex<HashMap<(String, i64), tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2615,6 +2634,8 @@ impl TelegramChannel {
             pending_model_pickers: tokio::sync::Mutex::new(HashMap::new()),
             approval_timeout_secs: 120,
             voice_drop_notice_timeout: VOICE_DROP_NOTICE_TIMEOUT,
+            reaction_clear_timeout: REACTION_CLEAR_TIMEOUT,
+            ack_reactions_in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2624,6 +2645,15 @@ impl TelegramChannel {
     #[cfg(test)]
     fn with_voice_drop_notice_timeout(mut self, timeout: Duration) -> Self {
         self.voice_drop_notice_timeout = timeout;
+        self
+    }
+
+    /// Shrink the `remove_reaction` clear bound so a stalled-clear test does
+    /// not wait out the production ceiling. Test-only: the ceiling protects
+    /// the turn, it is not operator-tunable.
+    #[cfg(test)]
+    fn with_reaction_clear_timeout(mut self, timeout: Duration) -> Self {
+        self.reaction_clear_timeout = timeout;
         self
     }
 
@@ -3557,8 +3587,9 @@ impl TelegramChannel {
         let url = self.api_url("setMessageReaction");
         let emoji = random_telegram_ack_reaction().to_string();
         let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
+        let key = (chat_id.clone(), message_id);
 
-        zeroclaw_spawn::spawn!(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             let response = match client.post(&url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -3573,6 +3604,16 @@ impl TelegramChannel {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add ACK reaction failed for chat_id=, message_id=: status=, body=");
             }
         });
+        self.track_ack_reaction(key, handle);
+    }
+
+    /// Remember a freshly spawned acknowledgement so `remove_reaction` can
+    /// settle it before clearing. Finished entries are dropped here, so the map
+    /// stays bounded by the acknowledgements still in flight.
+    fn track_ack_reaction(&self, key: (String, i64), handle: tokio::task::JoinHandle<()>) {
+        let mut inflight = self.ack_reactions_in_flight.lock();
+        inflight.retain(|_, task| !task.is_finished());
+        inflight.insert(key, handle);
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -8445,6 +8486,13 @@ Ensure only one `zeroclaw` process is using this bot token."
     /// an empty reaction list and `_emoji` is ignored: the slot holds whichever
     /// `TELEGRAM_ACK_REACTIONS` entry the ack path picked. A message id that is
     /// not in the `telegram_{chat_id}_{message_id}` form is a no-op.
+    ///
+    /// The real acknowledgement is sent by `try_add_ack_reaction_nonblocking`
+    /// in a detached task, so this settles that task before clearing: otherwise
+    /// the ack can land after the clear and restore the reaction with nothing
+    /// left to remove it. Both the settle wait and the clear request are bounded
+    /// by [`REACTION_CLEAR_TIMEOUT`] because the orchestrator awaits this while
+    /// holding the conversation permit.
     async fn remove_reaction(
         &self,
         channel_id: &str,
@@ -8455,19 +8503,53 @@ Ensure only one `zeroclaw` process is using this bot token."
             return Ok(());
         };
         let (chat_id, _) = Self::parse_reply_target(channel_id);
-        let body = build_telegram_clear_reaction_request(&chat_id, numeric_message_id);
-        let response = self
-            .http_client()
-            .post(self.api_url("setMessageReaction"))
-            .json(&body)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let err_body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Telegram setMessageReaction (clear) failed ({status}): {err_body}");
+
+        // Settle the in-flight ack first. Abort it on timeout so a late
+        // completion cannot re-add the reaction after the clear below.
+        let inflight = self
+            .ack_reactions_in_flight
+            .lock()
+            .remove(&(chat_id.clone(), numeric_message_id));
+        if let Some(mut handle) = inflight
+            && tokio::time::timeout(self.reaction_clear_timeout, &mut handle)
+                .await
+                .is_err()
+        {
+            handle.abort();
         }
-        Ok(())
+
+        let body = build_telegram_clear_reaction_request(&chat_id, numeric_message_id);
+        let clear = async {
+            let response = self
+                .http_client()
+                .post(self.api_url("setMessageReaction"))
+                .json(&body)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                anyhow::bail!("Telegram setMessageReaction (clear) failed ({status}): {err_body}");
+            }
+            Ok(())
+        };
+        match tokio::time::timeout(self.reaction_clear_timeout, clear).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Best-effort cleanup: the reply already finished, so a clear
+                // that never lands must not surface as a turn error.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "chat_id": chat_id,
+                            "message_id": numeric_message_id,
+                        })),
+                    "Telegram setMessageReaction (clear) timed out; abandoning the withdraw"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Delegates to [`Self::request_approval_attributed`] and drops the
@@ -9394,6 +9476,99 @@ mod tests {
             .remove_reaction("-100200300", "not-a-telegram-id", "\u{1F440}")
             .await
             .expect("an unparseable message id is a no-op");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_settles_the_inflight_ack_before_clearing() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Only the clear reaches the server; the ack is the gated task below.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        // Stand in for the detached ack request: a task we hold open so the
+        // clear has something in flight to settle.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let ack = zeroclaw_spawn::spawn!(async move {
+            let _ = release_rx.await;
+        });
+        channel
+            .ack_reactions_in_flight
+            .lock()
+            .insert(("-100200300".to_string(), 42), ack);
+
+        let clear = channel.remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}");
+        // The clear must not be sent while the ack is still in flight; release
+        // the ack and the clear then proceeds.
+        let probe = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let sent = mock_server.received_requests().await.unwrap().len();
+            let _ = release_tx.send(());
+            sent
+        };
+        let (result, sent_while_ack_pending) = tokio::join!(clear, probe);
+        result.expect("the clear succeeds once the ack settles");
+        assert_eq!(
+            sent_while_ack_pending, 0,
+            "remove_reaction must not clear before the in-flight ack settles"
+        );
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_bounds_a_stalled_clear() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Accepts the connection but never answers, so only the timeout can
+        // release the turn.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(120))
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_millis(100))
+        .with_mock_api_base(mock_server.uri());
+
+        let started = std::time::Instant::now();
+        channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect("a stalled clear is abandoned, not surfaced");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the clear must be bounded, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
