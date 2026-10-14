@@ -21,6 +21,19 @@ model = "my-model"
 tool_result_image_policy = "omit"
 ```
 
+### Native tool calling
+
+The `custom` slot defaults to **text-fallback**: ZeroClaw describes the tools in the system prompt and parses the model's `<tool_call>` XML from the reply instead of sending OpenAI `tools` in the request. A gateway that speaks the OpenAI tool-calling protocol should opt in per alias:
+
+```toml
+[providers.models.custom.gateway]
+uri = "https://gateway.example.com/v1"
+model = "my-model"
+native_tools = true
+```
+
+With `native_tools = true` the request carries `tools`, and tool results are replayed as native `role = "tool"` messages. Leave it unset (or `false`) for an endpoint that only understands the text protocol. Do not force `runtime_profiles.<profile>.tool_dispatcher = "native"` on an alias that does not set `native_tools = true`: the dispatcher then expects native tool calls that the request never carries.
+
 ### Connection warmup
 
 OpenAI-compatible providers warm the connection with `GET {base_url}/models`, using the same authentication and HTTP client settings as model listing.
