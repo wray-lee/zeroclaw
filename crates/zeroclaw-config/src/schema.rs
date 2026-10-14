@@ -1091,9 +1091,12 @@ pub struct ModelProviderConfig {
     /// factories in `zeroclaw-providers/src/factory.rs` consult the field:
     /// `groq` and `custom` default to text-fallback and enable native tool
     /// calling only on `Some(true)`, while `hailo_ollama` has no native tool
-    /// calling and rejects `Some(true)`. Every other family ignores it. An
-    /// OpenAI-compatible `custom` gateway that accepts OpenAI `tools`
-    /// payloads needs `native_tools = true`.
+    /// calling and rejects `Some(true)`. Every other family ignores it. For
+    /// `custom` the field gates only the chat-completions path: an alias with
+    /// `wire_api = "responses"` is served by the Responses provider, which is
+    /// selected before this field is consulted, ignores it, and supports
+    /// native tool calls regardless. A chat-completions `custom` gateway that
+    /// accepts OpenAI `tools` payloads needs `native_tools = true`.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
@@ -14741,9 +14744,10 @@ pub struct RuntimeProfileConfig {
     /// `"auto"` selects the native dispatcher only when the provider reports
     /// native tool calling, while `"native"` and `"xml"` force one strategy
     /// regardless of provider capability. Forcing `"native"` on a provider
-    /// whose factory disabled native tool calling (for example `custom`
-    /// without `native_tools = true`) sends no `tools` in the request, so the
-    /// model cannot emit native tool calls. `None` inherits.
+    /// whose factory disabled native tool calling (for example a
+    /// chat-completions `custom` alias without `native_tools = true`) sends no
+    /// `tools` in the request, so the model cannot emit native tool calls.
+    /// `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
     pub tool_call_dedup_exempt: Vec<String>,
