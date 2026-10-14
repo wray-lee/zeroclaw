@@ -763,6 +763,11 @@ pub struct LarkChannel {
     /// `[channels.lark.<alias>].ack_reactions` override, falling back to
     /// `[channels].ack_reactions`. Default `true`.
     ack_reactions: bool,
+    /// Emoji used for the inbound fast-ack. Set by the orchestrator from the
+    /// resolved `ack_reaction_in_progress` value so the orchestrator withdraws
+    /// exactly the reaction this channel added. An empty value disables the
+    /// fast-ack.
+    ack_emoji: String,
     reaction_ids: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
     stream_mode: StreamMode,
     /// Minimum interval between consecutive PATCH edits of the same draft
@@ -1032,7 +1037,7 @@ async fn handle_lark_http_event(
 
     let messages = state.channel.parse_event_payload_async(&payload).await;
     if !messages.is_empty()
-        && state.channel.ack_reactions
+        && state.channel.fast_ack_enabled()
         && let Some(message_id) = payload
             .pointer("/event/message/message_id")
             .and_then(|m| m.as_str())
@@ -1048,7 +1053,7 @@ async fn handle_lark_http_event(
                 &reaction_channel,
                 &reaction_reply_target,
                 &reaction_message_id,
-                "\u{1F440}",
+                &reaction_channel.ack_emoji,
             )
             .await
             {
@@ -1147,6 +1152,7 @@ impl LarkChannel {
             approval_timeout_secs: 120,
             per_user_session: false,
             ack_reactions: true,
+            ack_emoji: "\u{1F440}".to_string(),
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
@@ -1203,6 +1209,21 @@ impl LarkChannel {
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
         self
+    }
+
+    /// Set the emoji used for the inbound fast-ack. The orchestrator passes the
+    /// resolved `ack_reaction_in_progress` value so the reaction this channel
+    /// adds is the one the orchestrator later withdraws.
+    pub fn with_ack_emoji(mut self, emoji: String) -> Self {
+        self.ack_emoji = emoji;
+        self
+    }
+
+    /// Whether this instance should post the inbound fast-ack reaction.
+    /// Disabled by `[channels].ack_reactions = false`, by the per-alias
+    /// override, or by an empty in-progress acknowledgement emoji.
+    fn fast_ack_enabled(&self) -> bool {
+        self.ack_reactions && !self.ack_emoji.is_empty()
     }
 
     /// Configure the workspace root used to validate local outbound media
@@ -1717,7 +1738,7 @@ impl LarkChannel {
                         continue;
                     }
 
-                    if self.ack_reactions {
+                    if self.fast_ack_enabled() {
                         let reaction_channel = self.clone();
                         let reaction_message_id = lark_msg.message_id.clone();
                         let reaction_reply_target = lark_msg.chat_id.clone();
@@ -1726,7 +1747,7 @@ impl LarkChannel {
                                 &reaction_channel,
                                 &reaction_reply_target,
                                 &reaction_message_id,
-                                "\u{1F440}",
+                                &reaction_channel.ack_emoji,
                             )
                             .await
                         {
@@ -1745,7 +1766,7 @@ impl LarkChannel {
                             );
                         }
                     });
-                    } // if self.ack_reactions
+                    } // if self.fast_ack_enabled()
 
                     let channel_msg = ChannelMessage {
                         id: lark_msg.message_id.clone(),
@@ -5189,6 +5210,9 @@ mod tests {
     fn lark_config_serde() {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
         let lc = LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
@@ -5217,6 +5241,9 @@ mod tests {
     fn lark_config_toml_roundtrip() {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
         let lc = LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "app".into(),
             app_secret: "secret".into(),
@@ -5256,6 +5283,9 @@ mod tests {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
@@ -5288,6 +5318,9 @@ mod tests {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "cli_feishu_app123".into(),
             app_secret: "secret456".into(),
@@ -5319,6 +5352,9 @@ mod tests {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
@@ -5639,6 +5675,9 @@ mod tests {
         );
 
         let feishu_cfg = zeroclaw_config::schema::LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
