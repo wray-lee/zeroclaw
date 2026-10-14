@@ -924,6 +924,10 @@ const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Default minimum interval between Telegram draft edits.
 const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
+/// Character cap for the reasoning shown in a partial draft. Bounds the
+/// blockquote so the in-progress answer always keeps room in the message.
+const TELEGRAM_REASONING_DRAFT_MAX_CHARS: usize = 600;
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -938,6 +942,9 @@ pub struct TelegramChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
+    /// Reasoning visibility for the streaming draft. `Off` (default) keeps
+    /// the draft byte-for-byte as before; see `with_stream_reasoning`.
+    stream_reasoning: zeroclaw_config::schema::StreamReasoningMode,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
@@ -2562,6 +2569,7 @@ impl TelegramChannel {
             pairing,
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
+            stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Off,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
@@ -2738,6 +2746,66 @@ impl TelegramChannel {
             draft_update_interval_ms
         };
         self
+    }
+
+    /// Configure reasoning visibility for the streaming draft.
+    ///
+    /// Only effective in [`StreamMode::Partial`]: the other modes have no
+    /// editable draft to carry reasoning. `Off` (the default) leaves the draft
+    /// unchanged, `Status` shows a liveness-only thinking line and `Full`
+    /// renders the raw reasoning text as a collapsed blockquote above the
+    /// in-progress answer. See `TelegramConfig::stream_reasoning`.
+    pub fn with_stream_reasoning(
+        mut self,
+        mode: zeroclaw_config::schema::StreamReasoningMode,
+    ) -> Self {
+        self.stream_reasoning = mode;
+        self
+    }
+
+    /// Truncate an HTML-escaped fragment to `budget` bytes without splitting a
+    /// UTF-8 character or leaving a half-written `&entity;` behind for the Bot
+    /// API HTML parser to reject.
+    fn truncate_escaped_html(escaped: &str, budget: usize) -> String {
+        if escaped.len() <= budget {
+            return escaped.to_string();
+        }
+        let mut end = 0;
+        for (idx, ch) in escaped.char_indices() {
+            let next = idx + ch.len_utf8();
+            if next > budget {
+                break;
+            }
+            end = next;
+        }
+        let mut out = escaped[..end].to_string();
+        if let Some(amp) = out.rfind('&')
+            && !out[amp..].contains(';')
+        {
+            out.truncate(amp);
+        }
+        out
+    }
+
+    /// Render the mid-stream reasoning blockquote above the in-progress answer
+    /// for a partial draft edit.
+    ///
+    /// Reasoning is draft-only chrome: `finalize_draft` rewrites the whole
+    /// message with the final answer, so it never survives into the delivered
+    /// reply. The answer is HTML-escaped rather than Markdown-converted, which
+    /// keeps the draft's literal-Markdown look identical to `update_draft`'s
+    /// plain-text edits. The reasoning is capped first, on the raw text, so
+    /// escaping can never split an entity and the closing tag always survives
+    /// the caller's whole-message truncation.
+    fn reasoning_draft_html(reasoning: &str, answer: &str) -> String {
+        const OPEN: &str = "<blockquote expandable>";
+        const CLOSE: &str = "</blockquote>";
+        let reasoning = Self::escape_html(&crate::util::truncate_with_ellipsis(
+            reasoning.trim_end(),
+            TELEGRAM_REASONING_DRAFT_MAX_CHARS,
+        ));
+        let answer = Self::escape_html(answer);
+        format!("{OPEN}{reasoning}{CLOSE}\n\n{answer}")
     }
 
     /// Canonical source: `[channels.telegram.<alias>].multi_message_delay_ms`.
@@ -7666,6 +7734,81 @@ impl Channel for TelegramChannel {
         }
     }
 
+    /// Edit the partial draft with the in-progress answer plus the model's
+    /// reasoning as a collapsed HTML blockquote above it.
+    ///
+    /// A rejected HTML payload falls back to the plain-text edit so a draft is
+    /// never stranded. Both paths share the draft's per-chat edit pacing.
+    async fn update_draft_with_reasoning(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        answer: &str,
+        reasoning: &str,
+    ) -> anyhow::Result<()> {
+        if self.stream_mode != StreamMode::Partial
+            || self.stream_reasoning == zeroclaw_config::schema::StreamReasoningMode::Off
+            || reasoning.trim().is_empty()
+        {
+            return self.update_draft(recipient, message_id, answer).await;
+        }
+
+        let (chat_id, _) = Self::parse_reply_target(recipient);
+
+        // Same per-chat pacing as `update_draft`: the reasoning edit spends the
+        // draft's edit budget rather than bypassing it.
+        {
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(&chat_id) {
+                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < self.draft_update_interval_ms {
+                    return Ok(());
+                }
+            }
+        }
+
+        let message_id_parsed = match message_id.parse::<i64>() {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+
+        let html = Self::truncate_escaped_html(
+            &Self::reasoning_draft_html(reasoning, answer),
+            TELEGRAM_MAX_MESSAGE_LENGTH,
+        );
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id_parsed,
+            "text": html,
+            "parse_mode": "HTML",
+        });
+
+        let resp = self
+            .http_client()
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            self.last_draft_edit
+                .lock()
+                .insert(chat_id.clone(), std::time::Instant::now());
+            return Ok(());
+        }
+
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"error": format!("{}", err), "status": status.to_string()})
+            ),
+            "editMessageText (reasoning draft) failed; falling back to plain text"
+        );
+        self.update_draft(recipient, message_id, answer).await
+    }
+
     async fn flush_draft_turn(
         &self,
         recipient: &str,
@@ -12322,6 +12465,41 @@ mod tests {
             ch.api_url("getMe"),
             "http://127.0.0.1:8081/bot123:ABC/getMe"
         );
+    }
+
+    #[test]
+    fn reasoning_draft_html_wraps_reasoning_in_a_collapsed_blockquote() {
+        assert_eq!(
+            TelegramChannel::reasoning_draft_html("step one\nstep two", "the answer"),
+            "<blockquote expandable>step one\nstep two</blockquote>\n\nthe answer"
+        );
+    }
+
+    #[test]
+    fn reasoning_draft_html_escapes_both_halves() {
+        assert_eq!(
+            TelegramChannel::reasoning_draft_html("<b>raw</b>", "a & b"),
+            "<blockquote expandable>&lt;b&gt;raw&lt;/b&gt;</blockquote>\n\na &amp; b"
+        );
+    }
+
+    #[test]
+    fn reasoning_draft_html_caps_the_reasoning_and_keeps_the_answer() {
+        let long = "x".repeat(TELEGRAM_REASONING_DRAFT_MAX_CHARS + 50);
+        let html = TelegramChannel::reasoning_draft_html(&long, "answer");
+        assert!(html.ends_with("</blockquote>\n\nanswer"), "{html}");
+        assert!(html.contains("...</blockquote>"), "{html}");
+    }
+
+    #[test]
+    fn truncate_escaped_html_never_splits_a_character_or_an_entity() {
+        // `é` is two bytes, so a one-byte budget yields nothing.
+        assert_eq!(TelegramChannel::truncate_escaped_html("é", 1), "");
+        // A budget landing inside `&amp` drops the half-written entity.
+        assert_eq!(TelegramChannel::truncate_escaped_html("&amp;x", 4), "");
+        // A budget that keeps the whole entity keeps it verbatim.
+        assert_eq!(TelegramChannel::truncate_escaped_html("&amp;x", 5), "&amp;");
+        assert_eq!(TelegramChannel::truncate_escaped_html("abc", 10), "abc");
     }
 
     #[test]

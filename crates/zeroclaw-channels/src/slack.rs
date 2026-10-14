@@ -216,6 +216,9 @@ pub struct SlackChannel {
     stream_drafts: bool,
     /// Minimum interval (ms) between draft edits to stay within Slack rate limits.
     draft_update_interval_ms: u64,
+    /// Reasoning visibility for the streaming draft. `Off` (default) keeps the
+    /// draft byte-for-byte as before; see `with_stream_reasoning`.
+    stream_reasoning: zeroclaw_config::schema::StreamReasoningMode,
     /// Per-turn rate-limit tracker for draft edits.
     last_draft_edit: Mutex<HashMap<String, Instant>>,
     /// Maps lazy placeholder IDs to real Slack message timestamps.
@@ -422,6 +425,29 @@ fn unicode_emoji_to_slack_name(emoji: &str) -> &str {
 /// Slack's `chat.update` is rate-limited to ~1 req/sec per channel.
 const SLACK_DRAFT_UPDATE_INTERVAL_MS: u64 = 1200;
 
+/// mrkdwn quote prefix for one line of reasoning in a streaming draft.
+const SLACK_REASONING_QUOTE_PREFIX: &str = "> ";
+
+/// Render the model's reasoning as a mrkdwn quote above the in-progress answer
+/// for a streaming draft edit. Blank reasoning lines are dropped so the quote
+/// block stays contiguous; the whole string is truncated by `update_draft`.
+fn slack_reasoning_draft_text(reasoning: &str, answer: &str) -> String {
+    let mut out = String::new();
+    for line in reasoning.trim_end().lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str(SLACK_REASONING_QUOTE_PREFIX);
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(answer);
+    out
+}
+
 /// Maximum text length for a single Slack message (approx 40k chars).
 const SLACK_MESSAGE_MAX_CHARS: usize = 40_000;
 
@@ -495,6 +521,7 @@ impl SlackChannel {
             transcription_manager: None,
             stream_drafts: false,
             draft_update_interval_ms: SLACK_DRAFT_UPDATE_INTERVAL_MS,
+            stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Off,
             last_draft_edit: Mutex::new(HashMap::new()),
             lazy_draft_ts: tokio::sync::Mutex::new(HashMap::new()),
             cancel_reaction: None,
@@ -647,6 +674,21 @@ impl SlackChannel {
         if interval_ms > 0 {
             self.draft_update_interval_ms = interval_ms;
         }
+        self
+    }
+
+    /// Configure reasoning visibility for the streaming draft.
+    ///
+    /// Only effective when `stream_drafts = true`; otherwise there is no draft
+    /// to carry reasoning. `Off` (the default) leaves the draft unchanged,
+    /// `Status` shows a liveness-only thinking line and `Full` renders the raw
+    /// reasoning text as a quoted block above the in-progress answer. See
+    /// `SlackConfig::stream_reasoning`.
+    pub fn with_stream_reasoning(
+        mut self,
+        mode: zeroclaw_config::schema::StreamReasoningMode,
+    ) -> Self {
+        self.stream_reasoning = mode;
         self
     }
 
@@ -5563,6 +5605,30 @@ impl Channel for SlackChannel {
         Ok(())
     }
 
+    /// Edit the streaming draft with the in-progress answer plus the model's
+    /// reasoning as a mrkdwn quote above it.
+    ///
+    /// Reasoning is draft-only chrome: `finalize_draft` rewrites the message
+    /// with the final answer, so it never reaches the delivered reply. The edit
+    /// reuses `update_draft`, so it shares the same rate limit, lazy-draft
+    /// materialization and truncation.
+    async fn update_draft_with_reasoning(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        answer: &str,
+        reasoning: &str,
+    ) -> anyhow::Result<()> {
+        if !self.stream_drafts
+            || self.stream_reasoning == zeroclaw_config::schema::StreamReasoningMode::Off
+            || reasoning.trim().is_empty()
+        {
+            return self.update_draft(recipient, message_id, answer).await;
+        }
+        let text = slack_reasoning_draft_text(reasoning, answer);
+        self.update_draft(recipient, message_id, &text).await
+    }
+
     async fn update_draft_progress(
         &self,
         recipient: &str,
@@ -6325,6 +6391,22 @@ impl Channel for SlackChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slack_reasoning_draft_text_quotes_each_reasoning_line() {
+        assert_eq!(
+            slack_reasoning_draft_text("step one\n\nstep two\n", "the answer"),
+            "> step one\n> step two\n\nthe answer"
+        );
+    }
+
+    #[test]
+    fn slack_reasoning_draft_text_falls_back_to_the_answer() {
+        assert_eq!(
+            slack_reasoning_draft_text("   \n\n", "the answer"),
+            "the answer"
+        );
+    }
 
     #[test]
     fn split_text_into_chunks_safe_on_multibyte_utf8() {
