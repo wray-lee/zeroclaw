@@ -161,7 +161,7 @@ The all-features `Containerfile` source image builds for `linux/amd64` when that
 
 ### Docker Publish (`docker-publish.yml`)
 
-Builds, signs, and scans the generated four-variant matrix from `dev/ci/docker-tags.toml`: `minimal`, `default-features`, `dist`, and `all-features`. A human-created `v*` tag starts this workflow directly. A stable release started with `workflow_dispatch` creates its tag with `GITHUB_TOKEN`, which does not emit another tag-push event, so `release-stable-manual.yml` calls Docker Publish synchronously at the immutable release tag after the canonical release and Docker jobs succeed.
+Builds, signs, and scans the generated five-variant matrix from `dev/ci/docker-tags.toml`: `minimal`, `default-features`, `dist`, `dist-broad`, and `all-features`. A human-created `v*` tag starts this workflow directly. A stable release started with `workflow_dispatch` creates its tag with `GITHUB_TOKEN`, which does not emit another tag-push event, so `release-stable-manual.yml` calls Docker Publish synchronously at the immutable release tag after the canonical release and Docker jobs succeed.
 
 This matrix supplements rather than replaces the stable release's prebuilt `latest`, versioned, and `debian` images. The two paths use different build inputs and publish distinct tags.
 

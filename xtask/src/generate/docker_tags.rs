@@ -43,6 +43,15 @@ fn tag_specs() -> Vec<TagSpec> {
             dockerfile: "Dockerfile",
             platforms: MULTI_ARCH,
         },
+        // Broad channel set: `dist` plus the full channel aggregate, for
+        // deployments whose channel is outside the lean standard distribution.
+        // Multi-arch through `Dockerfile`; the kitchen sink stays `all-features`.
+        TagSpec {
+            stem: "dist-broad",
+            selection: Selection::DistBroad,
+            dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
+        },
         TagSpec {
             stem: "all-features",
             selection: Selection::All,
@@ -215,5 +224,32 @@ mod tests {
             );
         }
         assert!(all["features"].as_str().unwrap().contains("hardware"));
+    }
+
+    #[test]
+    fn broad_tag_carries_the_full_channel_set_without_the_kitchen_sink() {
+        let s = render(&root()).unwrap();
+        let v: toml::Value = toml::from_str(&s).unwrap();
+        let broad = v["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["stem"].as_str() == Some("dist-broad"))
+            .unwrap();
+        let rendered = broad["features"].as_str().unwrap();
+        for feature in
+            crate::generate::spec::resolve_feature_list(&root(), &Selection::DistBroad).unwrap()
+        {
+            assert!(
+                rendered.contains(&feature),
+                "dist-broad feature {feature} not rendered"
+            );
+        }
+        // The broad image exists for channels outside the lean standard
+        // distribution; Slack is the motivating case.
+        assert!(rendered.contains("channel-slack"));
+        // Still not the kitchen sink.
+        assert!(!rendered.contains("hardware"));
+        assert!(!rendered.contains("browser-native"));
     }
 }
