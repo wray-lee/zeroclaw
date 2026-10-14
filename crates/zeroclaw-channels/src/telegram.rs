@@ -680,6 +680,32 @@ fn build_telegram_ack_reaction_request(
     })
 }
 
+/// Build the `setMessageReaction` body that withdraws the bot's reaction.
+///
+/// Telegram gives a bot a single reaction slot per message, so an empty
+/// `reaction` list clears whatever emoji the bot set there, whichever one it was.
+fn build_telegram_clear_reaction_request(chat_id: &str, message_id: i64) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": []
+    })
+}
+
+/// The numeric message id inside a `telegram_{chat_id}_{message_id}` channel id.
+///
+/// Returns `None` for ids that are not in that shape, so a caller can skip the
+/// API call instead of reacting against a guessed message. The chat id may be
+/// negative, which is why the split is on the last `_`.
+fn parse_telegram_message_id(message_id: &str) -> Option<i64> {
+    message_id
+        .strip_prefix("telegram_")?
+        .rsplit_once('_')?
+        .1
+        .parse()
+        .ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelegramAttachmentKind {
     Image,
@@ -8413,6 +8439,37 @@ Ensure only one `zeroclaw` process is using this bot token."
         Ok(())
     }
 
+    /// Withdraw the bot's acknowledgement reaction once the reply is done.
+    ///
+    /// Telegram gives a bot a single reaction slot per message, so the clear is
+    /// an empty reaction list and `_emoji` is ignored: the slot holds whichever
+    /// `TELEGRAM_ACK_REACTIONS` entry the ack path picked. A message id that is
+    /// not in the `telegram_{chat_id}_{message_id}` form is a no-op.
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        let Some(numeric_message_id) = parse_telegram_message_id(message_id) else {
+            return Ok(());
+        };
+        let (chat_id, _) = Self::parse_reply_target(channel_id);
+        let body = build_telegram_clear_reaction_request(&chat_id, numeric_message_id);
+        let response = self
+            .http_client()
+            .post(self.api_url("setMessageReaction"))
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let err_body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram setMessageReaction (clear) failed ({status}): {err_body}");
+        }
+        Ok(())
+    }
+
     /// Delegates to [`Self::request_approval_attributed`] and drops the
     /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
@@ -9297,6 +9354,46 @@ mod tests {
         assert_eq!(body["message_id"], 42);
         assert_eq!(body["reaction"][0]["type"], "emoji");
         assert_eq!(body["reaction"][0]["emoji"], "⚡️");
+    }
+
+    #[test]
+    fn telegram_clear_reaction_request_shape() {
+        let body = build_telegram_clear_reaction_request("-100200300", 42);
+        assert_eq!(body["chat_id"], "-100200300");
+        assert_eq!(body["message_id"], 42);
+        assert_eq!(body["reaction"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn parse_telegram_message_id_reads_the_numeric_suffix() {
+        assert_eq!(
+            parse_telegram_message_id("telegram_-100200300_42"),
+            Some(42)
+        );
+        assert_eq!(parse_telegram_message_id("telegram_1234_7"), Some(7));
+    }
+
+    #[test]
+    fn parse_telegram_message_id_rejects_unrecognised_ids() {
+        assert_eq!(parse_telegram_message_id("telegram_1234"), None);
+        assert_eq!(parse_telegram_message_id("slack_1234_42"), None);
+        assert_eq!(parse_telegram_message_id("telegram_1234_abc"), None);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_skips_unparseable_message_id() {
+        // No fixture HTTP client is installed, so any network call would fail
+        // the test rather than pass silently.
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(Vec::<String>::new),
+            false,
+        );
+        channel
+            .remove_reaction("-100200300", "not-a-telegram-id", "\u{1F440}")
+            .await
+            .expect("an unparseable message id is a no-op");
     }
 
     #[test]
