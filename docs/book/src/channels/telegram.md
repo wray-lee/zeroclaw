@@ -278,7 +278,7 @@ paces the edits; raise it if Telegram rate-limits them.
   the in-progress answer.
 
 It is only effective with `stream_mode = "partial"`: the other modes have no editable
-draft to carry it, so the setting is inert. Reasoning is draft-only chrome — the
+draft to carry it, so the setting is inert. Reasoning is draft-only chrome: the
 finalized reply is rewritten from the answer alone and never contains it.
 
 ## Logs and troubleshooting

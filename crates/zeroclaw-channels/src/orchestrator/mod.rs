@@ -9573,7 +9573,11 @@ async fn process_channel_message_body(
 
     let matrix_single_message_streaming =
         matrix_single_message_streaming_enabled(ctx.as_ref(), &msg);
-    let stream_reasoning = stream_reasoning_for_config(ctx.prompt_config.as_ref(), &msg);
+    // Resolve reasoning visibility from the canonical live config, not the
+    // startup snapshot, so a published change reaches the next message without
+    // rebuilding the channels. The channels resolve it live as well; this read
+    // only decides whether the runtime emits reasoning deltas for the turn.
+    let stream_reasoning = stream_reasoning_for_config(&ctx.live_config.read(), &msg);
     let mut matrix_single_message_typing_scope = if matrix_single_message_streaming {
         target_channel.as_ref().map(|channel| {
             start_matrix_single_message_typing_scope(Arc::clone(channel), msg.reply_target.clone())
@@ -12769,6 +12773,24 @@ fn slack_thread_context_max_messages_resolver(
     })
 }
 
+#[cfg(feature = "channel-slack")]
+fn slack_stream_reasoning_resolver(
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
+    alias: &str,
+) -> Arc<dyn Fn() -> zeroclaw_config::schema::StreamReasoningMode + Send + Sync> {
+    let cfg_arc = config_arc.clone();
+    let alias = alias.to_string();
+    Arc::new(move || {
+        cfg_arc
+            .read()
+            .channels
+            .slack
+            .get(&alias)
+            .map(|sl| sl.stream_reasoning)
+            .unwrap_or(zeroclaw_config::schema::StreamReasoningMode::Off)
+    })
+}
+
 /// Returned by [`build_channel_by_id`] when no arm claims `channel_id`.
 ///
 /// One-off callers match on this sentinel instead of the error text so the
@@ -12843,7 +12865,6 @@ fn build_channel_by_id(
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_stream_reasoning(tg.stream_reasoning)
                 .with_passive_group_context(tg.passive_group_context)
                 .with_transcription_manager(
                     config.transcription.clone(),
@@ -12943,7 +12964,7 @@ fn build_channel_by_id(
                     resolved_transcription_manager(&config, &format!("slack.{alias}")),
                 )
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                .with_stream_reasoning(sl.stream_reasoning)
+                .with_stream_reasoning_resolver(slack_stream_reasoning_resolver(config_arc, &alias))
                 .with_cancel_reaction(sl.cancel_reaction.clone())
                 .with_approval_timeout_secs(sl.approval_timeout_secs),
             ))
@@ -14424,7 +14445,6 @@ fn collect_configured_channels_with_authority(
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                    .with_stream_reasoning(tg.stream_reasoning)
                     .with_passive_group_context(tg.passive_group_context)
                     .with_transcription_manager(
                         config.transcription.clone(),
@@ -14568,7 +14588,9 @@ fn collect_configured_channels_with_authority(
                         resolved_transcription_manager(&config, &format!("slack.{alias}")),
                     )
                     .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                    .with_stream_reasoning(sl.stream_reasoning)
+                    .with_stream_reasoning_resolver(slack_stream_reasoning_resolver(
+                        config_arc, alias,
+                    ))
                     .with_cancel_reaction(sl.cancel_reaction.clone())
                     .with_approval_timeout_secs(sl.approval_timeout_secs),
                 ),
@@ -50560,6 +50582,35 @@ This is an example JSON object for profile settings."#;
         live.publish(live.next_revision().unwrap(), updated)
             .unwrap();
         assert_eq!(resolver(), 8);
+    }
+
+    #[cfg(feature = "channel-slack")]
+    #[test]
+    fn slack_stream_reasoning_resolver_tracks_live_alias_config() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SlackConfig {
+                stream_reasoning: StreamReasoningMode::Status,
+                ..Default::default()
+            },
+        );
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let resolver = slack_stream_reasoning_resolver(&live.handle(), "default");
+
+        assert_eq!(resolver(), StreamReasoningMode::Status);
+        let mut updated = live.snapshot();
+        updated
+            .channels
+            .slack
+            .get_mut("default")
+            .unwrap()
+            .stream_reasoning = StreamReasoningMode::Full;
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
+        assert_eq!(resolver(), StreamReasoningMode::Full);
     }
 
     // ── Query classification in channel message processing ─────────

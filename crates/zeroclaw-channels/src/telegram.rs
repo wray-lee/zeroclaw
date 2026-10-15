@@ -942,9 +942,6 @@ pub struct TelegramChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
-    /// Reasoning visibility for the streaming draft. `Off` (default) keeps
-    /// the draft byte-for-byte as before; see `with_stream_reasoning`.
-    stream_reasoning: zeroclaw_config::schema::StreamReasoningMode,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
@@ -2569,7 +2566,6 @@ impl TelegramChannel {
             pairing,
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
-            stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Off,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
@@ -2748,21 +2744,6 @@ impl TelegramChannel {
         self
     }
 
-    /// Configure reasoning visibility for the streaming draft.
-    ///
-    /// Only effective in [`StreamMode::Partial`]: the other modes have no
-    /// editable draft to carry reasoning. `Off` (the default) leaves the draft
-    /// unchanged, `Status` shows a liveness-only thinking line and `Full`
-    /// renders the raw reasoning text as a collapsed blockquote above the
-    /// in-progress answer. See `TelegramConfig::stream_reasoning`.
-    pub fn with_stream_reasoning(
-        mut self,
-        mode: zeroclaw_config::schema::StreamReasoningMode,
-    ) -> Self {
-        self.stream_reasoning = mode;
-        self
-    }
-
     /// Truncate an HTML-escaped fragment to `budget` bytes without splitting a
     /// UTF-8 character or leaving a half-written `&entity;` behind for the Bot
     /// API HTML parser to reject.
@@ -2822,6 +2803,26 @@ impl TelegramChannel {
                     .map(|tg| tg.multi_message_delay_ms)
             })
             .unwrap_or(DEFAULT_MULTI_MESSAGE_DELAY_MS)
+    }
+
+    /// Canonical source: `[channels.telegram.<alias>].stream_reasoning`.
+    ///
+    /// Resolved live at use time rather than snapshotted into the handle, so a
+    /// published config change reaches the draft without a channel rebuild
+    /// (see AGENTS.md "Single Source Of Truth").
+    fn resolve_stream_reasoning(&self) -> zeroclaw_config::schema::StreamReasoningMode {
+        self.persist
+            .as_ref()
+            .and_then(|config| {
+                config
+                    .live_handle()
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&self.alias)
+                    .map(|tg| tg.stream_reasoning)
+            })
+            .unwrap_or(zeroclaw_config::schema::StreamReasoningMode::Off)
     }
 
     fn new_multi_message_draft_id() -> String {
@@ -7747,7 +7748,7 @@ impl Channel for TelegramChannel {
         reasoning: &str,
     ) -> anyhow::Result<()> {
         if self.stream_mode != StreamMode::Partial
-            || self.stream_reasoning == zeroclaw_config::schema::StreamReasoningMode::Off
+            || self.resolve_stream_reasoning() == zeroclaw_config::schema::StreamReasoningMode::Off
             || reasoning.trim().is_empty()
         {
             return self.update_draft(recipient, message_id, answer).await;
@@ -8908,6 +8909,47 @@ mod tests {
             .multi_message_delay_ms = 0;
         config.publish_for_test(updated);
         assert_eq!(ch.multi_message_delay_ms(), 0);
+    }
+
+    #[test]
+    fn stream_reasoning_resolves_live_from_canonical_config() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let alias = "telegram_test_alias";
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                stream_mode: StreamMode::Partial,
+                stream_reasoning: StreamReasoningMode::Full,
+                ..TelegramConfig::default()
+            },
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 750)
+        .with_persistence_authority(authority.clone());
+
+        assert_eq!(ch.resolve_stream_reasoning(), StreamReasoningMode::Full);
+        let mut updated = authority.snapshot_config();
+        updated
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias")
+            .stream_reasoning = StreamReasoningMode::Off;
+        authority.publish_for_test(updated);
+        assert_eq!(
+            ch.resolve_stream_reasoning(),
+            StreamReasoningMode::Off,
+            "the reasoning mode must be read from live config, not a startup copy"
+        );
     }
 
     impl TelegramChannel {

@@ -216,9 +216,11 @@ pub struct SlackChannel {
     stream_drafts: bool,
     /// Minimum interval (ms) between draft edits to stay within Slack rate limits.
     draft_update_interval_ms: u64,
-    /// Reasoning visibility for the streaming draft. `Off` (default) keeps the
-    /// draft byte-for-byte as before; see `with_stream_reasoning`.
-    stream_reasoning: zeroclaw_config::schema::StreamReasoningMode,
+    /// Resolves the current canonical `stream_reasoning` value on demand. This
+    /// is a resolver, not a cached copy, so config reload remains the source of
+    /// truth (see AGENTS.md "Single Source Of Truth").
+    stream_reasoning_resolver:
+        Arc<dyn Fn() -> zeroclaw_config::schema::StreamReasoningMode + Send + Sync>,
     /// Per-turn rate-limit tracker for draft edits.
     last_draft_edit: Mutex<HashMap<String, Instant>>,
     /// Maps lazy placeholder IDs to real Slack message timestamps.
@@ -532,7 +534,9 @@ impl SlackChannel {
             transcription_manager: None,
             stream_drafts: false,
             draft_update_interval_ms: SLACK_DRAFT_UPDATE_INTERVAL_MS,
-            stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Off,
+            stream_reasoning_resolver: Arc::new(|| {
+                zeroclaw_config::schema::StreamReasoningMode::Off
+            }),
             last_draft_edit: Mutex::new(HashMap::new()),
             lazy_draft_ts: tokio::sync::Mutex::new(HashMap::new()),
             cancel_reaction: None,
@@ -688,19 +692,25 @@ impl SlackChannel {
         self
     }
 
-    /// Configure reasoning visibility for the streaming draft.
+    /// Supply the resolver for the streaming draft's reasoning visibility.
     ///
-    /// Only effective when `stream_drafts = true`; otherwise there is no draft
-    /// to carry reasoning. `Off` (the default) leaves the draft unchanged,
-    /// `Status` shows a liveness-only thinking line and `Full` renders the raw
-    /// reasoning text as a quoted block above the in-progress answer. See
-    /// `SlackConfig::stream_reasoning`.
-    pub fn with_stream_reasoning(
+    /// The orchestrator resolves `[channels.slack.<alias>].stream_reasoning`
+    /// from the canonical live config per edit, so a published change reaches
+    /// the draft without a channel rebuild. `Off` (the default) leaves the
+    /// draft unchanged, `Status` shows a liveness-only thinking line and `Full`
+    /// renders the raw reasoning text as a quoted block above the in-progress
+    /// answer; the setting is only effective while `stream_drafts = true`.
+    pub fn with_stream_reasoning_resolver(
         mut self,
-        mode: zeroclaw_config::schema::StreamReasoningMode,
+        resolver: Arc<dyn Fn() -> zeroclaw_config::schema::StreamReasoningMode + Send + Sync>,
     ) -> Self {
-        self.stream_reasoning = mode;
+        self.stream_reasoning_resolver = resolver;
         self
+    }
+
+    /// Reasoning visibility for the streaming draft, resolved live.
+    fn stream_reasoning(&self) -> zeroclaw_config::schema::StreamReasoningMode {
+        (self.stream_reasoning_resolver)()
     }
 
     /// Set the emoji reaction name that cancels an in-flight request.
@@ -718,7 +728,7 @@ impl SlackChannel {
 
         let resp = self
             .http_client()
-            .post("https://slack.com/api/chat.delete")
+            .post(self.slack_api_url("chat.delete"))
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -5631,7 +5641,7 @@ impl Channel for SlackChannel {
         reasoning: &str,
     ) -> anyhow::Result<()> {
         if !self.stream_drafts
-            || self.stream_reasoning == zeroclaw_config::schema::StreamReasoningMode::Off
+            || self.stream_reasoning() == zeroclaw_config::schema::StreamReasoningMode::Off
             || reasoning.trim().is_empty()
         {
             return self.update_draft(recipient, message_id, answer).await;
@@ -6590,6 +6600,39 @@ mod tests {
         assert_eq!(ch.thread_context_max_messages(), 3);
         configured.store(7, Ordering::Relaxed);
         assert_eq!(ch.thread_context_max_messages(), 7);
+    }
+
+    #[test]
+    fn stream_reasoning_resolver_reads_live_value() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let configured = Arc::new(AtomicUsize::new(0));
+        let resolver_value = Arc::clone(&configured);
+        let ch = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_stream_reasoning_resolver(Arc::new(move || {
+            match resolver_value.load(Ordering::Relaxed) {
+                1 => zeroclaw_config::schema::StreamReasoningMode::Status,
+                2 => zeroclaw_config::schema::StreamReasoningMode::Full,
+                _ => zeroclaw_config::schema::StreamReasoningMode::Off,
+            }
+        }));
+
+        assert_eq!(
+            ch.stream_reasoning(),
+            zeroclaw_config::schema::StreamReasoningMode::Off
+        );
+        configured.store(2, Ordering::Relaxed);
+        assert_eq!(
+            ch.stream_reasoning(),
+            zeroclaw_config::schema::StreamReasoningMode::Full,
+            "the resolver must observe the newly published mode without a rebuild"
+        );
     }
 
     #[test]
@@ -8941,18 +8984,23 @@ mod tests {
 
         // A failed final edit must fall through to the delete+send fallback and
         // still deliver the answer, rather than bail with `?` and leave the
-        // reasoning-bearing draft on screen. The fallback's `chat.delete`
-        // targets the real Slack API (not the mockable api base), so the
-        // observable proxy here is the fresh `chat.postMessage`.
+        // reasoning-bearing draft on screen. `chat.delete` routes through the
+        // mockable api base, so the fallback's cleanup is observable here.
+        Mock::given(method("POST"))
+            .and(path("/chat.delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+            })))
+            .mount(&server)
+            .await;
+
         ch.finalize_draft("C123", &draft, "the final answer", false)
             .await
             .unwrap();
 
-        let posts: Vec<_> = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
+        let requests = server.received_requests().await.unwrap();
+        let posts: Vec<_> = requests
+            .iter()
             .filter(|r| r.url.path() == "/chat.postMessage")
             .collect();
         assert_eq!(
@@ -8963,6 +9011,23 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&posts.last().unwrap().body).contains("the final answer"),
             "the fallback must deliver the answer as a fresh message",
+        );
+
+        let deletes: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/chat.delete")
+            .collect();
+        assert_eq!(
+            deletes.len(),
+            1,
+            "the failed final edit must delete the reasoning-bearing draft",
+        );
+        let delete_body: serde_json::Value =
+            serde_json::from_slice(&deletes[0].body).expect("chat.delete body is JSON");
+        assert_eq!(
+            delete_body.get("ts").and_then(|v| v.as_str()),
+            Some("draft-ts"),
+            "chat.delete must target the real draft ts",
         );
     }
 
