@@ -1289,6 +1289,20 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// The in-progress acknowledgement emoji this channel posted to
+    /// `message_id` when the message arrived, if the channel fast-acks inbound
+    /// messages.
+    ///
+    /// The channel is the canonical source of the emoji it actually added, so
+    /// the orchestrator resolves it here instead of recomputing it: a
+    /// configured value that changed between receipt and cleanup would
+    /// otherwise withdraw a different emoji and strand the reaction the
+    /// channel left on the message. The default returns `None`, and the
+    /// orchestrator then resolves and withdraws the in-progress emoji itself.
+    async fn inbound_ack_emoji(&self, _message_id: &str) -> Option<String> {
+        None
+    }
+
     /// Pin a message in the channel.
     async fn pin_message(&self, _channel_id: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())

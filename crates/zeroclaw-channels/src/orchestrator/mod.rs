@@ -9085,11 +9085,25 @@ async fn process_channel_message_body(
     // message without rebuilding the channels. The resolved set is kept for
     // this message only, so its cleanup withdraws exactly the in-progress
     // emoji that was added.
-    let ack_emojis = resolve_channel_ack_emojis(
+    let mut ack_emojis = resolve_channel_ack_emojis(
         &ctx.live_config.read(),
         msg.channel.as_str(),
         msg.channel_alias.as_deref(),
     );
+    // When the channel already posted the in-progress acknowledgement on
+    // receipt (Lark's inbound fast-ack), withdraw exactly the emoji it added
+    // instead of the value resolved now: a configured value that changed
+    // between receipt and cleanup would otherwise withdraw a different emoji
+    // and strand the reaction the channel left on the message. The channel is
+    // the canonical source for what it added, and it reports the emoji only
+    // once its own add has finished.
+    let inbound_ack_emoji = match target_channel.as_ref() {
+        Some(channel) => channel.inbound_ack_emoji(&msg.id).await,
+        None => None,
+    };
+    if let Some(emoji) = inbound_ack_emoji {
+        ack_emojis.in_progress = emoji;
+    }
     let early_ack_task: Option<tokio::task::JoinHandle<()>> =
         if resolve_channel_ack_reactions(&ctx, &msg)
             && !ack_emojis.in_progress.is_empty()
@@ -24343,6 +24357,10 @@ api_key = "anthropic-key"
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
+        /// In-progress acknowledgement emoji this channel already posted on
+        /// receipt, reported back to the orchestrator so a test can prove the
+        /// cleanup withdraws that emoji rather than a changed setting.
+        inbound_ack: Option<String>,
     }
 
     /// Records every outbound `SendMessage` whole, so a test can assert on
@@ -25335,6 +25353,10 @@ api_key = "anthropic-key"
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
             self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn inbound_ack_emoji(&self, _message_id: &str) -> Option<String> {
+            self.inbound_ack.clone()
         }
 
         async fn add_reaction(
@@ -36177,6 +36199,61 @@ BTC is currently around $65,000 based on latest tool output."#
             removed.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
             vec!["\u{23F3}"],
             "the acknowledgement must be withdrawn using the live config's emoji"
+        );
+    }
+
+    // The in-progress acknowledgement must be withdrawn with the emoji the
+    // channel actually posted on receipt, not one recomputed at cleanup: here
+    // the channel posted the hourglass and the live config then moved to the
+    // fire emoji, so cleanup must still withdraw the hourglass instead of
+    // stranding it and adding nothing.
+    #[tokio::test]
+    async fn process_channel_message_withdraws_inbound_ack_after_setting_change() {
+        let channel_impl = Arc::new(RecordingChannel {
+            inbound_ack: Some("\u{23F3}".to_string()),
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.ack_reaction_in_progress = "\u{1F525}".to_string();
+        config.channels.ack_reaction_done = String::new();
+        let runtime_ctx = ack_reaction_test_context(channel, config);
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg-inbound".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert_eq!(
+            added.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            vec!["\u{23F3}"],
+            "the emoji the channel posted on receipt must be reused, not the changed setting"
+        );
+        drop(added);
+
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert_eq!(
+            removed.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            vec!["\u{23F3}"],
+            "cleanup must withdraw the emoji the channel posted, not the new setting"
         );
     }
 

@@ -721,6 +721,13 @@ struct PendingApproval {
     arguments_summary: String,
 }
 
+/// Per-message inbound fast-ack state: the acknowledgement emoji this instance
+/// posted and the task that posts it, keyed by message id.
+type InboundAckEntry = (String, tokio::task::JoinHandle<()>, Instant);
+
+/// Per-message inbound fast-ack state, keyed by message id.
+type InboundAckEmojis = std::sync::Mutex<std::collections::HashMap<String, InboundAckEntry>>;
+
 #[derive(Clone)]
 pub struct LarkChannel {
     app_id: String,
@@ -770,6 +777,14 @@ pub struct LarkChannel {
     /// orchestrator later withdraws. An empty result disables the fast-ack.
     ack_emoji_resolver: Arc<dyn Fn() -> String + Send + Sync>,
     reaction_ids: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+    /// In-progress acknowledgement emoji this instance posted for each inbound
+    /// message, keyed by message id, recorded when the inbound fast-ack is
+    /// scheduled and taken back by the orchestrator before it withdraws the
+    /// acknowledgement. The channel is the canonical source of the emoji it
+    /// actually added, so a configured value that changed between receipt and
+    /// cleanup cannot strand the reaction. Per-message state only; the
+    /// configured emoji still comes from live config at use time.
+    inbound_ack_emojis: Arc<InboundAckEmojis>,
     stream_mode: StreamMode,
     /// Minimum interval between consecutive PATCH edits of the same draft
     /// card. Tunes to Feishu's 5 QPS per-message cap. Set by the
@@ -1049,12 +1064,13 @@ async fn handle_lark_http_event(
         // ack target; parse_event_payload_async already filtered
         // out unauthorized senders and non-text payloads.
         let reaction_reply_target = messages[0].reply_target.clone();
-        zeroclaw_spawn::spawn!(async move {
+        let fast_ack_emoji = ack_emoji.clone();
+        let fast_ack_handle = zeroclaw_spawn::spawn!(async move {
             if let Err(e) = <LarkChannel as Channel>::add_reaction(
                 &reaction_channel,
                 &reaction_reply_target,
                 &reaction_message_id,
-                &ack_emoji,
+                &fast_ack_emoji,
             )
             .await
             {
@@ -1070,6 +1086,9 @@ async fn handle_lark_http_event(
                 );
             }
         });
+        state
+            .channel
+            .record_inbound_ack_emoji(message_id, &ack_emoji, fast_ack_handle);
     }
 
     for msg in messages {
@@ -1155,6 +1174,7 @@ impl LarkChannel {
             ack_reactions: true,
             ack_emoji_resolver: Arc::new(|| "\u{1F440}".to_string()),
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            inbound_ack_emojis: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1231,6 +1251,42 @@ impl LarkChannel {
     fn ack_emoji(&self) -> Option<String> {
         let emoji = (self.ack_emoji_resolver)();
         (self.ack_reactions && !emoji.is_empty()).then_some(emoji)
+    }
+
+    /// Record the in-progress acknowledgement emoji this instance is about to
+    /// post for `message_id`, together with the task that posts it. The
+    /// orchestrator takes this back before withdrawing the acknowledgement, so
+    /// it removes exactly the emoji the channel added and waits for that add to
+    /// finish first. Entries for messages the orchestrator never handles are
+    /// dropped by the same age bound used for the other per-message caches.
+    fn record_inbound_ack_emoji(
+        &self,
+        message_id: &str,
+        emoji: &str,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let now = Instant::now();
+        let mut map = self
+            .inbound_ack_emojis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, (_, _, recorded)| now.duration_since(*recorded) < Duration::from_secs(300));
+        map.insert(message_id.to_string(), (emoji.to_string(), handle, now));
+    }
+
+    /// Take back the in-progress acknowledgement emoji recorded for
+    /// `message_id`, waiting for the channel's own add to finish so the caller
+    /// never withdraws before the reaction exists. `None` when the channel did
+    /// not fast-ack this message.
+    async fn take_inbound_ack_emoji(&self, message_id: &str) -> Option<String> {
+        let entry = self
+            .inbound_ack_emojis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(message_id);
+        let (emoji, handle, _) = entry?;
+        let _ = handle.await;
+        Some(emoji)
     }
 
     /// Configure the workspace root used to validate local outbound media
@@ -1749,12 +1805,13 @@ impl LarkChannel {
                         let reaction_channel = self.clone();
                         let reaction_message_id = lark_msg.message_id.clone();
                         let reaction_reply_target = lark_msg.chat_id.clone();
-                        zeroclaw_spawn::spawn!(async move {
+                        let fast_ack_emoji = ack_emoji.clone();
+                        let fast_ack_handle = zeroclaw_spawn::spawn!(async move {
                             if let Err(e) = <LarkChannel as Channel>::add_reaction(
                                 &reaction_channel,
                                 &reaction_reply_target,
                                 &reaction_message_id,
-                                &ack_emoji,
+                                &fast_ack_emoji,
                             )
                             .await
                         {
@@ -1773,6 +1830,11 @@ impl LarkChannel {
                             );
                         }
                     });
+                        self.record_inbound_ack_emoji(
+                            &lark_msg.message_id,
+                            &ack_emoji,
+                            fast_ack_handle,
+                        );
                     } // if let Some(ack_emoji) = self.ack_emoji()
 
                     let channel_msg = ChannelMessage {
@@ -2964,6 +3026,10 @@ impl Channel for LarkChannel {
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn inbound_ack_emoji(&self, message_id: &str) -> Option<String> {
+        self.take_inbound_ack_emoji(message_id).await
     }
 
     async fn add_reaction(
@@ -4376,6 +4442,26 @@ mod tests {
         let revision = live.next_revision().expect("allocate revision");
         live.publish(revision, disabled).expect("publish revision");
         assert_eq!(ch.ack_emoji(), None);
+    }
+
+    // The inbound fast-ack records the emoji it posted per message, and the
+    // orchestrator takes it back exactly once so cleanup withdraws the emoji
+    // the channel added rather than one recomputed later.
+    #[tokio::test]
+    async fn inbound_ack_emoji_is_recorded_and_taken_once() {
+        let ch = make_channel();
+        let handle = zeroclaw_spawn::spawn!(async {});
+        ch.record_inbound_ack_emoji("om_msg1", "\u{23F3}", handle);
+        assert_eq!(
+            ch.take_inbound_ack_emoji("om_msg1").await.as_deref(),
+            Some("\u{23F3}")
+        );
+        assert_eq!(
+            ch.take_inbound_ack_emoji("om_msg1").await,
+            None,
+            "the entry is consumed once so a replay cannot withdraw twice"
+        );
+        assert_eq!(ch.take_inbound_ack_emoji("om_missing").await, None);
     }
 
     async fn post_lark_challenge(
