@@ -17232,18 +17232,21 @@ pub struct SlackConfig {
     /// string disables the in-progress acknowledgement for this instance.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_in_progress: Option<String>,
     /// Override for the top-level `[channels].ack_reaction_done`. When `None`,
     /// the instance falls back to the channels-wide value; an empty string
     /// withdraws the acknowledgement and adds nothing.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_done: Option<String>,
     /// Override for the top-level `[channels].ack_reaction_error`. When `None`,
     /// the instance falls back to the channels-wide value; an empty string
     /// withdraws the acknowledgement and adds nothing.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_error: Option<String>,
     /// Enable progressive draft message streaming via `chat.update`.
     #[tab(Behavior)]
@@ -17821,18 +17824,21 @@ pub struct MatrixConfig {
     /// string disables the in-progress acknowledgement for this instance.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_in_progress: Option<String>,
     /// Override for the top-level `[channels].ack_reaction_done`. When `None`,
     /// the instance falls back to the channels-wide value; an empty string
     /// withdraws the acknowledgement and adds nothing.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_done: Option<String>,
     /// Override for the top-level `[channels].ack_reaction_error`. When `None`,
     /// the instance falls back to the channels-wide value; an empty string
     /// withdraws the acknowledgement and adds nothing.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_error: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -19342,18 +19348,21 @@ pub struct LarkConfig {
     /// string disables the in-progress acknowledgement for this instance.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_in_progress: Option<String>,
     /// Override for the top-level `[channels].ack_reaction_done`. When `None`,
     /// the instance falls back to the channels-wide value; an empty string
     /// withdraws the acknowledgement and adds nothing.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_done: Option<String>,
     /// Override for the top-level `[channels].ack_reaction_error`. When `None`,
     /// the instance falls back to the channels-wide value; an empty string
     /// withdraws the acknowledgement and adds nothing.
     #[tab(Behavior)]
     #[serde(default)]
+    #[empty_is_value]
     pub ack_reaction_error: Option<String>,
 
     /// Streaming mode for the LLM response: `off` (default) routes every
@@ -43444,6 +43453,53 @@ stream_tool_arguments = [
         // Empty string clears Option
         mx.set_prop("channels.matrix.user_id", "").unwrap();
         assert!(mx.user_id.is_none());
+    }
+
+    #[test]
+    async fn set_prop_empty_ack_reaction_override_is_preserved() {
+        // The `ack_reaction_*` overrides give the empty string its own
+        // meaning ("withdraw the acknowledgement and add nothing"), so an
+        // explicit empty value must survive `set_prop` instead of clearing the
+        // override back to inheritance. An unset override still falls back to
+        // the channels-wide value.
+        let mut slack = SlackConfig::default();
+        slack
+            .set_prop("channels.slack.ack_reaction_in_progress", "")
+            .unwrap();
+        slack
+            .set_prop("channels.slack.ack_reaction_done", "")
+            .unwrap();
+        slack
+            .set_prop("channels.slack.ack_reaction_error", "")
+            .unwrap();
+        assert_eq!(slack.ack_reaction_in_progress.as_deref(), Some(""));
+        assert_eq!(slack.ack_reaction_done.as_deref(), Some(""));
+        assert_eq!(slack.ack_reaction_error.as_deref(), Some(""));
+
+        let mut matrix = MatrixConfig::default();
+        matrix
+            .set_prop("channels.matrix.ack_reaction_done", "")
+            .unwrap();
+        assert_eq!(matrix.ack_reaction_done.as_deref(), Some(""));
+
+        let mut lark = LarkConfig::default();
+        lark.set_prop("channels.lark.ack_reaction_in_progress", "")
+            .unwrap();
+        assert_eq!(lark.ack_reaction_in_progress.as_deref(), Some(""));
+
+        // The explicit unset sentinel still clears back to inheritance, and a
+        // non-empty value still stores normally.
+        matrix
+            .set_prop(
+                "channels.matrix.ack_reaction_done",
+                crate::traits::UNSET_DISPLAY,
+            )
+            .unwrap();
+        assert_eq!(matrix.ack_reaction_done, None);
+        matrix
+            .set_prop("channels.matrix.ack_reaction_done", "\u{1F389}")
+            .unwrap();
+        assert_eq!(matrix.ack_reaction_done.as_deref(), Some("\u{1F389}"));
     }
 
     #[test]
