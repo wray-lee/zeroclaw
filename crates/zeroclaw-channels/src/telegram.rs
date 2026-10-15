@@ -8574,7 +8574,7 @@ Ensure only one `zeroclaw` process is using this bot token."
     /// The real acknowledgement is sent by `try_add_ack_reaction_nonblocking`
     /// in a detached task, so this settles that task before clearing: otherwise
     /// the ack can land after the clear and restore the reaction with nothing
-    /// left to remove it. The settle wait is bounded by [`REACTION_CLEAR_TIMEOUT`]
+    /// left to remove it. The settle wait is bounded by `REACTION_CLEAR_TIMEOUT`
     /// because the orchestrator awaits this while holding the conversation
     /// permit. A request already on the wire cannot be recalled, so an ack that
     /// outlives the bound keeps the clear: the ack task runs it after the add
