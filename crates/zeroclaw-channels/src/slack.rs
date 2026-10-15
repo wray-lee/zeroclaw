@@ -428,12 +428,23 @@ const SLACK_DRAFT_UPDATE_INTERVAL_MS: u64 = 1200;
 /// mrkdwn quote prefix for one line of reasoning in a streaming draft.
 const SLACK_REASONING_QUOTE_PREFIX: &str = "> ";
 
+/// Character cap for the reasoning shown in a Slack streaming draft. Bounds
+/// the quote block so the in-progress answer always keeps room in the message:
+/// `update_draft` keeps only the first [`SLACK_MESSAGE_MAX_CHARS`] bytes, so an
+/// unbounded reasoning trace (including reasoning accumulated across tool
+/// rounds) could otherwise push the answer out of the draft entirely.
+const SLACK_REASONING_DRAFT_MAX_CHARS: usize = 1_000;
+
 /// Render the model's reasoning as a mrkdwn quote above the in-progress answer
 /// for a streaming draft edit. Blank reasoning lines are dropped so the quote
-/// block stays contiguous; the whole string is truncated by `update_draft`.
+/// block stays contiguous. The reasoning is capped separately from the answer
+/// so a long trace can never crowd the answer out of the message; the combined
+/// string is then truncated by `update_draft`.
 fn slack_reasoning_draft_text(reasoning: &str, answer: &str) -> String {
+    let reasoning =
+        crate::util::truncate_with_ellipsis(reasoning.trim_end(), SLACK_REASONING_DRAFT_MAX_CHARS);
     let mut out = String::new();
-    for line in reasoning.trim_end().lines() {
+    for line in reasoning.lines() {
         if line.trim().is_empty() {
             continue;
         }
@@ -5697,11 +5708,10 @@ impl Channel for SlackChannel {
         let draft_thread_ts = draft_turn.and_then(|turn| turn.thread_ts);
 
         let real_ts = self.resolve_draft_ts(message_id).await;
-        // Clean up lazy mapping
-        self.lazy_draft_ts.lock().await.remove(message_id);
 
         let Some(real_ts) = real_ts else {
             // Draft was never materialized — just send as a fresh message
+            self.lazy_draft_ts.lock().await.remove(message_id);
             let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
             return self.send(&msg).await;
         };
@@ -5709,6 +5719,7 @@ impl Channel for SlackChannel {
         // If text exceeds Slack limit, delete draft and send as regular message
         if text.len() > SLACK_MESSAGE_MAX_CHARS {
             let _ = self.delete_message(recipient, &real_ts).await;
+            self.lazy_draft_ts.lock().await.remove(message_id);
             let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
             return self.send(&msg).await;
         }
@@ -5729,32 +5740,57 @@ impl Channel for SlackChannel {
         }
 
         let update_url = self.slack_api_url("chat.update");
-        let resp = self
+        // A transport failure or a non-JSON body is just as terminal as an
+        // `ok: false`: either way the draft still holds the reasoning quote, so
+        // the final edit must fall through to the delete+send fallback below
+        // rather than bail with `?` and leave it on screen. `real_ts` is kept
+        // until that cleanup finishes so the message can still be deleted.
+        let delivered = match self
             .http_client()
             .post(update_url)
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
-            .await?;
+            .await
+        {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(resp_body) => resp_body.get("ok") == Some(&serde_json::Value::Bool(true)),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "chat.update (finalize) response was not JSON"
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "chat.update (finalize) HTTP error"
+                );
+                false
+            }
+        };
 
-        let resp_body: serde_json::Value = resp.json().await?;
-        if resp_body.get("ok") == Some(&serde_json::Value::Bool(true)) {
+        if delivered {
+            self.lazy_draft_ts.lock().await.remove(message_id);
             return Ok(());
         }
 
         // Fallback: delete draft and send fresh
-        let err = resp_body
-            .get("error")
-            .and_then(|e| e.as_str())
-            .unwrap_or("unknown");
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                .with_attrs(::serde_json::json!({"error": "final chat.update failed"})),
             "chat.update (finalize) failed; falling back to delete+send"
         );
 
         let _ = self.delete_message(recipient, &real_ts).await;
+        self.lazy_draft_ts.lock().await.remove(message_id);
         let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
         self.send(&msg).await
     }
@@ -6405,6 +6441,24 @@ mod tests {
         assert_eq!(
             slack_reasoning_draft_text("   \n\n", "the answer"),
             "the answer"
+        );
+    }
+
+    /// A long reasoning trace must not crowd the in-progress answer out of the
+    /// draft: `update_draft` keeps only the first `SLACK_MESSAGE_MAX_CHARS`
+    /// bytes, so the reasoning is capped independently of the answer.
+    #[test]
+    fn slack_reasoning_draft_text_caps_reasoning_so_the_answer_survives() {
+        let reasoning = "reasoning line\n".repeat(5_000);
+        let text = slack_reasoning_draft_text(&reasoning, "the answer");
+        assert!(
+            text.len() < SLACK_MESSAGE_MAX_CHARS,
+            "the rendered draft must fit in one message even with huge reasoning: {} bytes",
+            text.len(),
+        );
+        assert!(
+            text.ends_with("the answer"),
+            "the answer must remain the tail of the draft",
         );
     }
 
@@ -8843,6 +8897,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&("thread-one".to_string(), String::new())],
             "finalization must clear exactly the finalized turn's thread: {calls:?}"
+        );
+    }
+
+    /// The final `chat.update` overwrites the draft's reasoning quote with the
+    /// answer. If that request fails outright the draft must not be left
+    /// holding the reasoning: finalization falls through to delete+send so the
+    /// draft-only promise holds even on the failure path.
+    #[tokio::test]
+    async fn finalize_draft_removes_the_draft_when_the_final_edit_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "draft-ts",
+            })))
+            .mount(&server)
+            .await;
+        // The final edit request itself fails at the transport layer.
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat.update"))
+                    .respond_with_err(|_: &Request| {
+                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")
+                    }),
+            )
+            .await;
+
+        let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
+        let draft = ch
+            .send_draft(&SendMessage::new("...", "C123").in_thread(Some("thread-one".to_string())))
+            .await
+            .unwrap()
+            .unwrap();
+        // Materialize the draft so `finalize_draft` has a real ts to clean up.
+        ch.update_draft("C123", &draft, "Received").await.unwrap();
+
+        // A failed final edit must fall through to the delete+send fallback and
+        // still deliver the answer, rather than bail with `?` and leave the
+        // reasoning-bearing draft on screen. The fallback's `chat.delete`
+        // targets the real Slack API (not the mockable api base), so the
+        // observable proxy here is the fresh `chat.postMessage`.
+        ch.finalize_draft("C123", &draft, "the final answer", false)
+            .await
+            .unwrap();
+
+        let posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/chat.postMessage")
+            .collect();
+        assert_eq!(
+            posts.len(),
+            2,
+            "the draft materialization plus the fallback fresh send",
+        );
+        assert!(
+            String::from_utf8_lossy(&posts.last().unwrap().body).contains("the final answer"),
+            "the fallback must deliver the answer as a fresh message",
         );
     }
 

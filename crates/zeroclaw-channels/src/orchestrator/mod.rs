@@ -6026,6 +6026,38 @@ pub(crate) fn remap_confirmed_offset(confirmed_prefix: &str, frame: &str) -> usi
         .map_or(0, |i| i + 2)
 }
 
+/// Edit a streaming draft with the current answer plus the model's reasoning.
+///
+/// A failed edit is logged, never propagated: the draft is best-effort chrome
+/// and the final reply is delivered by `finalize_draft` regardless.
+///
+/// The reasoning is scanned with the configured outbound detector here, on the
+/// joined buffer rather than per delta: a credential split across deltas
+/// matches nothing on its own and only reconstructs once concatenated, so the
+/// complete text must cross the detector before it is rendered.
+async fn edit_draft_with_reasoning(
+    channel: &Arc<dyn Channel>,
+    reply_target: &str,
+    draft_id: &str,
+    answer: &str,
+    reasoning: &str,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) {
+    let reasoning = redact_channel_outbound_leaks(reasoning, leak_detection, content_format);
+    if let Err(e) = channel
+        .update_draft_with_reasoning(reply_target, draft_id, answer, &reasoning)
+        .await
+    {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Draft update failed"
+        );
+    }
+}
+
 /// Pump draft deltas to the channel transport, sanitizing every partial on the
 /// way out.
 ///
@@ -6042,30 +6074,6 @@ pub(crate) fn remap_confirmed_offset(confirmed_prefix: &str, frame: &str) -> usi
 ///
 /// `known_tool_names` comes from the same registry the final sanitizer reads,
 /// so both boundaries judge a protocol payload by the same tool inventory.
-/// Edit a streaming draft with the current answer plus the model's reasoning.
-///
-/// A failed edit is logged, never propagated: the draft is best-effort chrome
-/// and the final reply is delivered by `finalize_draft` regardless.
-async fn edit_draft_with_reasoning(
-    channel: &Arc<dyn Channel>,
-    reply_target: &str,
-    draft_id: &str,
-    answer: &str,
-    reasoning: &str,
-) {
-    if let Err(e) = channel
-        .update_draft_with_reasoning(reply_target, draft_id, answer, reasoning)
-        .await
-    {
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Draft update failed"
-        );
-    }
-}
-
 #[cfg(test)]
 async fn run_draft_updater(
     channel: Arc<dyn Channel>,
@@ -6164,6 +6172,8 @@ async fn run_draft_updater_with_leak_detection(
                     &draft_id,
                     &visible,
                     &reasoning_buf,
+                    &leak_detection,
+                    content_format,
                 )
                 .await;
             }
@@ -6247,6 +6257,8 @@ async fn run_draft_updater_with_leak_detection(
                         &draft_id,
                         &visible,
                         &reasoning_buf,
+                        &leak_detection,
+                        content_format,
                     )
                     .await;
                 }
@@ -6271,6 +6283,8 @@ async fn run_draft_updater_with_leak_detection(
                         &draft_id,
                         &visible,
                         &reasoning_buf,
+                        &leak_detection,
+                        content_format,
                     )
                     .await;
                 } else if let Err(e) = channel
@@ -54522,6 +54536,65 @@ Done."#;
         assert!(
             channel_impl.reasoning_updates.lock().await.is_empty(),
             "reasoning stays private until the channel opts in"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_redacts_a_secret_split_across_reasoning_deltas() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(StreamDelta::Text("partial answer".to_string()))
+            .await
+            .unwrap();
+        // An AWS key split so that no single delta matches the detector: each
+        // fragment passes the per-delta scrub and only the joined buffer
+        // reconstructs `AKIA` + 16 characters.
+        tx.send(StreamDelta::Reasoning("AKIA".to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Reasoning("12345678".to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Reasoning("90123456".to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::new(Mutex::new(String::new())),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Full,
+            rx,
+        )
+        .await;
+
+        let updates = channel_impl.reasoning_updates.lock().await.clone();
+        assert!(
+            !updates.is_empty(),
+            "reasoning edits must reach the channel"
+        );
+        assert!(
+            updates
+                .iter()
+                .all(|(_, reasoning)| !reasoning.contains("AKIA1234567890123456")),
+            "a credential split across reasoning deltas must not reach the draft intact: {updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|(_, reasoning)| reasoning.contains("[REDACTED_AWS_CREDENTIAL]")),
+            "the joined reasoning buffer must be scanned by the outbound detector: {updates:?}"
         );
     }
 

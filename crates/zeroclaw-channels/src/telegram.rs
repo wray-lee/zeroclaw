@@ -8013,21 +8013,34 @@ impl Channel for TelegramChannel {
             "parse_mode": "HTML",
         });
 
-        let resp = self
+        // A transport failure is as terminal as a rejected payload: both leave
+        // the reasoning quote on screen, so both must fall through to the
+        // delete+send fallback below rather than bail with `?`.
+        let html_edit = self
             .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
-            .await?;
+            .await;
 
-        match Self::classify_edit_message_response(resp).await {
-            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
-            EditMessageResult::Failed(status) => {
+        match html_edit {
+            Ok(resp) => match Self::classify_edit_message_response(resp).await {
+                EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
+                EditMessageResult::Failed(status) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                        "Telegram finalize_draft HTML edit failed; retrying without parse_mode"
+                    );
+                }
+            },
+            Err(err) => {
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
-                    "Telegram finalize_draft HTML edit failed; retrying without parse_mode"
+                        .with_attrs(::serde_json::json!({"error": err.to_string()})),
+                    "Telegram finalize_draft HTML edit request failed; retrying without parse_mode"
                 );
             }
         }
@@ -8039,22 +8052,33 @@ impl Channel for TelegramChannel {
             "text": text,
         });
 
-        let resp = self
+        let plain_edit = self
             .http_client()
             .post(self.api_url("editMessageText"))
             .json(&plain_body)
             .send()
-            .await?;
+            .await;
 
-        match Self::classify_edit_message_response(resp).await {
-            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
-            EditMessageResult::Failed(status) => {
+        match plain_edit {
+            Ok(resp) => match Self::classify_edit_message_response(resp).await {
+                EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
+                EditMessageResult::Failed(status) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                        "Telegram finalize_draft plain edit failed; attempting delete+send fallback"
+                    );
+                }
+            },
+            Err(err) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
-                    "Telegram finalize_draft plain edit failed; attempting delete+send fallback"
+                        .with_attrs(::serde_json::json!({"error": err.to_string()})),
+                    "Telegram finalize_draft plain edit request failed; attempting delete+send fallback"
                 );
             }
         }
@@ -8901,6 +8925,69 @@ mod tests {
             );
             self.with_api_base(api_base)
         }
+    }
+
+    /// A failed final `editMessageText` must not leave the reasoning-bearing
+    /// draft on screen: finalization falls through to delete+send so the draft
+    /// is removed even when the edit request itself errors at the transport.
+    #[tokio::test]
+    async fn finalize_draft_deletes_the_draft_when_the_final_edit_request_fails() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path_regex(r"/bot[^/]+/editMessageText$"))
+                    .respond_with_err(|_: &Request| {
+                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")
+                    }),
+            )
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 99 }
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "main",
+            Arc::new(|| vec!["test_user".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 1000)
+        .with_mock_api_base(server.uri());
+
+        ch.finalize_draft("42", "77", "the final answer", true)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.url.path().ends_with("/deleteMessage")),
+            "a failed final edit must delete the reasoning-bearing draft",
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.url.path().ends_with("/sendMessage")),
+            "the answer must still be delivered after the failed edit",
+        );
     }
 
     #[test]
