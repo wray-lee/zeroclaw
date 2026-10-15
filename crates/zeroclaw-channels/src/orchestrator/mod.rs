@@ -8798,13 +8798,32 @@ async fn add_outcome_ack(channel: &dyn Channel, target: &str, message_id: &str, 
     let _ = channel.add_reaction(target, message_id, emoji).await;
 }
 
+/// Wait for an in-progress acknowledgement add to finish before its
+/// withdrawal. The wait is bounded by the turn's cancellation token so a
+/// stalled reaction endpoint cannot pin the turn: `/stop` releases the wait
+/// instead of leaving the execution slot occupied.
+async fn await_ack_add(
+    task: Option<tokio::task::JoinHandle<()>>,
+    cancellation_token: &CancellationToken,
+) {
+    let Some(task) = task else {
+        return;
+    };
+    tokio::select! {
+        _ = task => {}
+        _ = cancellation_token.cancelled() => {}
+    }
+}
+
 async fn reconcile_early_ack(
     ctx: &ChannelRuntimeContext,
     msg: &ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
     early_ack_task: Option<tokio::task::JoinHandle<()>>,
+    inbound_ack_completion: Option<tokio::task::JoinHandle<()>>,
     emojis: &ChannelAckEmojis,
     completion: Option<AckCompletion>,
+    cancellation_token: &CancellationToken,
 ) {
     if !resolve_channel_ack_reactions(ctx, msg) {
         return;
@@ -8812,11 +8831,10 @@ async fn reconcile_early_ack(
     let Some(channel) = target_channel else {
         return;
     };
-    // Wait for the spawned in-progress add to land first; otherwise a fast
+    // Wait for the spawned in-progress adds to land first; otherwise a fast
     // early-return path could remove before the add runs and strand the ack.
-    if let Some(task) = early_ack_task {
-        let _ = task.await;
-    }
+    await_ack_add(early_ack_task, cancellation_token).await;
+    await_ack_add(inbound_ack_completion, cancellation_token).await;
     withdraw_ack(&**channel, &msg.reply_target, &msg.id, &emojis.in_progress).await;
     let outcome = match completion {
         Some(AckCompletion::Done) => Some(emojis.done.as_str()),
@@ -9095,14 +9113,17 @@ async fn process_channel_message_body(
     // instead of the value resolved now: a configured value that changed
     // between receipt and cleanup would otherwise withdraw a different emoji
     // and strand the reaction the channel left on the message. The channel is
-    // the canonical source for what it added, and it reports the emoji only
-    // once its own add has finished.
-    let inbound_ack_emoji = match target_channel.as_ref() {
-        Some(channel) => channel.inbound_ack_emoji(&msg.id).await,
+    // the canonical source for what it added. Its add task is carried forward
+    // and awaited only during cleanup, never here, so a stalled reaction
+    // endpoint can never delay the reply.
+    let mut inbound_ack_completion: Option<tokio::task::JoinHandle<()>> = None;
+    let inbound_ack = match target_channel.as_ref() {
+        Some(channel) => channel.inbound_ack(&msg.id).await,
         None => None,
     };
-    if let Some(emoji) = inbound_ack_emoji {
-        ack_emojis.in_progress = emoji;
+    if let Some(ack) = inbound_ack {
+        ack_emojis.in_progress = ack.emoji;
+        inbound_ack_completion = ack.completion;
     }
     let early_ack_task: Option<tokio::task::JoinHandle<()>> =
         if resolve_channel_ack_reactions(&ctx, &msg)
@@ -9244,8 +9265,10 @@ async fn process_channel_message_body(
             &msg,
             target_channel.as_ref(),
             early_ack_task,
+            inbound_ack_completion,
             &ack_emojis,
             Some(AckCompletion::Done),
+            &cancellation_token,
         )
         .await;
         return;
@@ -9304,8 +9327,10 @@ async fn process_channel_message_body(
                 &msg,
                 target_channel.as_ref(),
                 early_ack_task,
+                inbound_ack_completion,
                 &ack_emojis,
                 Some(AckCompletion::Error),
+                &cancellation_token,
             )
             .await;
             return;
@@ -9710,8 +9735,10 @@ async fn process_channel_message_body(
             &msg,
             target_channel.as_ref(),
             early_ack_task,
+            inbound_ack_completion,
             &ack_emojis,
             None,
+            &cancellation_token,
         )
         .await;
         if resolve_channel_ack_reactions(&ctx, &msg)
@@ -11115,14 +11142,13 @@ async fn process_channel_message_body(
     }
 
     // Swap the in-progress acknowledgement for the configured outcome emoji
-    // (withdraw-only when that emoji is empty). Await the spawned ack add first
-    // so the remove can never race ahead of it.
+    // (withdraw-only when that emoji is empty). Await the spawned ack adds
+    // first so the remove can never race ahead of them.
     if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
     {
-        if let Some(task) = early_ack_task {
-            let _ = task.await;
-        }
+        await_ack_add(early_ack_task, &cancellation_token).await;
+        await_ack_add(inbound_ack_completion, &cancellation_token).await;
         withdraw_ack(
             &**channel,
             &msg.reply_target,
@@ -24361,6 +24387,9 @@ api_key = "anthropic-key"
         /// receipt, reported back to the orchestrator so a test can prove the
         /// cleanup withdraws that emoji rather than a changed setting.
         inbound_ack: Option<String>,
+        /// Pending add task handed back with the recorded acknowledgement, so a
+        /// test can prove the reply never waits for the channel's own add.
+        inbound_ack_completion: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     }
 
     /// Records every outbound `SendMessage` whole, so a test can assert on
@@ -25355,8 +25384,13 @@ api_key = "anthropic-key"
             Ok(())
         }
 
-        async fn inbound_ack_emoji(&self, _message_id: &str) -> Option<String> {
-            self.inbound_ack.clone()
+        async fn inbound_ack(
+            &self,
+            _message_id: &str,
+        ) -> Option<::zeroclaw_api::channel::InboundAck> {
+            let emoji = self.inbound_ack.clone()?;
+            let completion = self.inbound_ack_completion.lock().await.take();
+            Some(::zeroclaw_api::channel::InboundAck { emoji, completion })
         }
 
         async fn add_reaction(
@@ -36255,6 +36289,62 @@ BTC is currently around $65,000 based on latest tool output."#
             vec!["\u{23F3}"],
             "cleanup must withdraw the emoji the channel posted, not the new setting"
         );
+    }
+
+    // A stalled inbound acknowledgement add must not delay the reply: the
+    // channel's own add task is awaited only during cleanup, so the model
+    // answer is delivered while that task is still pending.
+    #[tokio::test]
+    async fn process_channel_message_reply_does_not_wait_for_inbound_ack() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let channel_impl = Arc::new(RecordingChannel {
+            inbound_ack: Some("\u{1F440}".to_string()),
+            inbound_ack_completion: tokio::sync::Mutex::new(Some(zeroclaw_spawn::spawn!(
+                async move {
+                    let _ = release_rx.await;
+                }
+            ))),
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx =
+            ack_reaction_test_context(channel, zeroclaw_config::schema::Config::default());
+
+        let turn = zeroclaw_spawn::spawn!(process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg-pending-ack".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        ));
+
+        let replied = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !channel_impl.sent_messages.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            replied.is_ok(),
+            "the reply must be sent without waiting for the pending inbound ack add"
+        );
+
+        let _ = release_tx.send(());
+        turn.await.expect("turn task");
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelMessage, InboundAck, SendMessage};
 use zeroclaw_config::pairing::constant_time_eq;
 use zeroclaw_config::schema::StreamMode;
 
@@ -1256,9 +1256,10 @@ impl LarkChannel {
     /// Record the in-progress acknowledgement emoji this instance is about to
     /// post for `message_id`, together with the task that posts it. The
     /// orchestrator takes this back before withdrawing the acknowledgement, so
-    /// it removes exactly the emoji the channel added and waits for that add to
-    /// finish first. Entries for messages the orchestrator never handles are
-    /// dropped by the same age bound used for the other per-message caches.
+    /// it removes exactly the emoji the channel added and can wait for that add
+    /// to finish during cleanup. Entries for messages the orchestrator never
+    /// handles are dropped by the same age bound used for the other per-message
+    /// caches.
     fn record_inbound_ack_emoji(
         &self,
         message_id: &str,
@@ -1274,19 +1275,23 @@ impl LarkChannel {
         map.insert(message_id.to_string(), (emoji.to_string(), handle, now));
     }
 
-    /// Take back the in-progress acknowledgement emoji recorded for
-    /// `message_id`, waiting for the channel's own add to finish so the caller
-    /// never withdraws before the reaction exists. `None` when the channel did
-    /// not fast-ack this message.
-    async fn take_inbound_ack_emoji(&self, message_id: &str) -> Option<String> {
+    /// Take back the in-progress acknowledgement recorded for `message_id`
+    /// without waiting for the channel's own add: the reply path must never
+    /// block on a stalled reaction endpoint. The returned [`InboundAck`] carries
+    /// the emoji the channel actually posted and the task that posts it, so the
+    /// caller can wait for that add during cleanup, before withdrawing. `None`
+    /// when the channel did not fast-ack this message.
+    fn take_inbound_ack(&self, message_id: &str) -> Option<InboundAck> {
         let entry = self
             .inbound_ack_emojis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(message_id);
         let (emoji, handle, _) = entry?;
-        let _ = handle.await;
-        Some(emoji)
+        Some(InboundAck {
+            emoji,
+            completion: Some(handle),
+        })
     }
 
     /// Configure the workspace root used to validate local outbound media
@@ -3028,8 +3033,8 @@ impl Channel for LarkChannel {
         Ok(())
     }
 
-    async fn inbound_ack_emoji(&self, message_id: &str) -> Option<String> {
-        self.take_inbound_ack_emoji(message_id).await
+    async fn inbound_ack(&self, message_id: &str) -> Option<InboundAck> {
+        self.take_inbound_ack(message_id)
     }
 
     async fn add_reaction(
@@ -4448,20 +4453,45 @@ mod tests {
     // orchestrator takes it back exactly once so cleanup withdraws the emoji
     // the channel added rather than one recomputed later.
     #[tokio::test]
-    async fn inbound_ack_emoji_is_recorded_and_taken_once() {
+    async fn inbound_ack_is_recorded_and_taken_once() {
         let ch = make_channel();
         let handle = zeroclaw_spawn::spawn!(async {});
         ch.record_inbound_ack_emoji("om_msg1", "\u{23F3}", handle);
-        assert_eq!(
-            ch.take_inbound_ack_emoji("om_msg1").await.as_deref(),
-            Some("\u{23F3}")
+        let ack = ch.take_inbound_ack("om_msg1").expect("recorded ack");
+        assert_eq!(ack.emoji, "\u{23F3}");
+        assert!(
+            ack.completion.is_some(),
+            "the add task must be handed back so cleanup can wait for it"
         );
-        assert_eq!(
-            ch.take_inbound_ack_emoji("om_msg1").await,
-            None,
+        assert!(
+            ch.take_inbound_ack("om_msg1").is_none(),
             "the entry is consumed once so a replay cannot withdraw twice"
         );
-        assert_eq!(ch.take_inbound_ack_emoji("om_missing").await, None);
+        assert!(ch.take_inbound_ack("om_missing").is_none());
+    }
+
+    // Taking the recorded acknowledgement must never wait for the channel's own
+    // add: the reply path hands the pending task back instead of awaiting it, so
+    // a stalled reaction endpoint cannot delay the answer.
+    #[tokio::test]
+    async fn take_inbound_ack_does_not_wait_for_the_add() {
+        let ch = make_channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let _ = release_rx.await;
+        });
+        ch.record_inbound_ack_emoji("om_slow", "\u{1F440}", handle);
+        let ack = tokio::time::timeout(Duration::from_millis(200), async {
+            ch.take_inbound_ack("om_slow")
+        })
+        .await
+        .expect("taking the acknowledgement must not wait for the pending add")
+        .expect("recorded ack");
+        assert_eq!(ack.emoji, "\u{1F440}");
+        let _ = release_tx.send(());
+        if let Some(handle) = ack.completion {
+            let _ = handle.await;
+        }
     }
 
     async fn post_lark_challenge(

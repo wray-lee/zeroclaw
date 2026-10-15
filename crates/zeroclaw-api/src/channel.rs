@@ -866,6 +866,27 @@ impl fmt::Display for FinalizePartialDelivery {
 
 impl std::error::Error for FinalizePartialDelivery {}
 
+/// An in-progress acknowledgement a channel already posted for an inbound
+/// message, reported to the orchestrator so it withdraws exactly the emoji the
+/// channel added and waits for the channel's own add to land first.
+///
+/// The channel is the canonical source of the emoji it actually added, so the
+/// orchestrator resolves it here instead of recomputing it: a configured value
+/// that changed between receipt and cleanup would otherwise withdraw a
+/// different emoji and strand the reaction the channel left on the message.
+///
+/// The wait for [`completion`](Self::completion) is deliberately deferred: it
+/// is awaited only during cleanup, never before the reply, so a stalled
+/// reaction endpoint can never delay the agent's answer.
+pub struct InboundAck {
+    /// The in-progress acknowledgement emoji the channel posted for the
+    /// message.
+    pub emoji: String,
+    /// Resolves once the channel's own add has finished. `None` when the
+    /// channel has no separate add task to wait for.
+    pub completion: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -1289,7 +1310,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
-    /// The in-progress acknowledgement emoji this channel posted to
+    /// The in-progress acknowledgement this channel already posted to
     /// `message_id` when the message arrived, if the channel fast-acks inbound
     /// messages.
     ///
@@ -1299,7 +1320,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// otherwise withdraw a different emoji and strand the reaction the
     /// channel left on the message. The default returns `None`, and the
     /// orchestrator then resolves and withdraws the in-progress emoji itself.
-    async fn inbound_ack_emoji(&self, _message_id: &str) -> Option<String> {
+    ///
+    /// The returned [`InboundAck::completion`] is awaited only during cleanup,
+    /// never before the reply, so a stalled reaction endpoint cannot delay the
+    /// answer.
+    async fn inbound_ack(&self, _message_id: &str) -> Option<InboundAck> {
         None
     }
 
