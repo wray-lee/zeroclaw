@@ -61,6 +61,11 @@ ARG ZEROCLAW_RELEASE_LTO="fat"
 ARG ZEROCLAW_RELEASE_CODEGEN_UNITS="1"
 ENV CARGO_PROFILE_RELEASE_LTO=${ZEROCLAW_RELEASE_LTO} \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${ZEROCLAW_RELEASE_CODEGEN_UNITS}
+# Fork-only check branch: make the effective release profile and the rustc
+# command line visible in the build log (throwaway measurement, not part of
+# the PR).
+ENV CARGO_TERM_VERBOSE=true
+RUN echo "ZEROCLAW-PROFILE lto=${CARGO_PROFILE_RELEASE_LTO} codegen_units=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}"
 # >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 # >>> end generated:docker-features-arg <<<
@@ -234,6 +239,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 RUN for b in zeroclaw zerocode; do \
       size=$(stat -c%s "/app/$b") && \
       if [ "$size" -lt 1000000 ]; then echo "ERROR: $b too small (${size} bytes), likely dummy build artifact" && exit 1; fi; \
+      echo "ZEROCLAW-BINSIZE arch=$TARGETARCH bin=$b bytes=$size"; \
     done
 
 # Prepare runtime directory structure and default config inline (no extra stage).
