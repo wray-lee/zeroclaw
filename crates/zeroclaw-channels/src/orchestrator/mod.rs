@@ -9426,7 +9426,10 @@ async fn process_channel_message_body(
                     &msg,
                     target_channel.as_ref(),
                     early_ack_task,
-                    Some("\u{26A0}\u{FE0F}"),
+                    inbound_ack_completion,
+                    &ack_emojis,
+                    Some(AckCompletion::Error),
+                    &cancellation_token,
                 )
                 .await;
                 return;
