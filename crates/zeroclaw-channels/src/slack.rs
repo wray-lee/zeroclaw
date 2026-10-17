@@ -6591,7 +6591,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // `send_draft` records a progress update; spend no wall-clock time on
+        // Materialize the lazy draft so the edits below take the chat.update
+        // path rather than the first-post path.
+        ch.update_draft("C123", &draft, "...").await.unwrap();
+        // Materializing records a progress update; spend no wall-clock time on
         // the per-draft edit pacing.
         ch.last_draft_edit
             .lock()
