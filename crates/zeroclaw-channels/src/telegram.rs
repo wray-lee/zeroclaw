@@ -2789,6 +2789,46 @@ impl TelegramChannel {
         format!("{OPEN}{reasoning}{CLOSE}\n\n{answer}")
     }
 
+    /// Render the draft's reasoning slot under the mode resolved for this edit.
+    ///
+    /// `full` keeps the raw reasoning blockquote. `status` publishes only the
+    /// liveness thinking line: the runtime's own tick when the turn already runs
+    /// in status mode, otherwise the canonical first-round line. The latter
+    /// matters for a live switch from `full` to `status` mid-turn — the runtime
+    /// keeps emitting raw reasoning deltas for the rest of the turn, so the
+    /// renderer is the boundary that must stop disclosing it.
+    fn reasoning_draft_html_for_mode(
+        mode: zeroclaw_config::schema::StreamReasoningMode,
+        reasoning: &str,
+        answer: &str,
+    ) -> String {
+        use zeroclaw_config::schema::StreamReasoningMode;
+        match mode {
+            StreamReasoningMode::Full => Self::reasoning_draft_html(reasoning, answer),
+            StreamReasoningMode::Status => {
+                let line = Self::reasoning_status_line(reasoning);
+                format!(
+                    "{}\n\n{}",
+                    Self::escape_html(&line),
+                    Self::escape_html(answer)
+                )
+            }
+            StreamReasoningMode::Off => Self::escape_html(answer),
+        }
+    }
+
+    /// Liveness-only line for `stream_reasoning = "status"`.
+    fn reasoning_status_line(reasoning: &str) -> String {
+        // The tick carries its trailing newline; the predicate requires it.
+        if zeroclaw_runtime::agent::loop_::is_thinking_status_text(reasoning) {
+            reasoning.trim_end().to_string()
+        } else {
+            zeroclaw_runtime::agent::loop_::thinking_status_text(0)
+                .trim_end()
+                .to_string()
+        }
+    }
+
     /// Canonical source: `[channels.telegram.<alias>].multi_message_delay_ms`.
     fn resolve_multi_message_delay_ms(&self) -> u64 {
         self.persist
@@ -7747,8 +7787,9 @@ impl Channel for TelegramChannel {
         answer: &str,
         reasoning: &str,
     ) -> anyhow::Result<()> {
+        let mode = self.resolve_stream_reasoning();
         if self.stream_mode != StreamMode::Partial
-            || self.resolve_stream_reasoning() == zeroclaw_config::schema::StreamReasoningMode::Off
+            || mode == zeroclaw_config::schema::StreamReasoningMode::Off
             || reasoning.trim().is_empty()
         {
             return self.update_draft(recipient, message_id, answer).await;
@@ -7774,7 +7815,7 @@ impl Channel for TelegramChannel {
         };
 
         let html = Self::truncate_escaped_html(
-            &Self::reasoning_draft_html(reasoning, answer),
+            &Self::reasoning_draft_html_for_mode(mode, reasoning, answer),
             TELEGRAM_MAX_MESSAGE_LENGTH,
         );
         let body = serde_json::json!({
@@ -12618,6 +12659,133 @@ mod tests {
         let html = TelegramChannel::reasoning_draft_html(&long, "answer");
         assert!(html.ends_with("</blockquote>\n\nanswer"), "{html}");
         assert!(html.contains("...</blockquote>"), "{html}");
+    }
+
+    #[test]
+    fn reasoning_draft_html_for_mode_distinguishes_status_from_full() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let full = TelegramChannel::reasoning_draft_html_for_mode(
+            StreamReasoningMode::Full,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert!(full.contains("the raw reasoning"), "{full}");
+
+        let status = TelegramChannel::reasoning_draft_html_for_mode(
+            StreamReasoningMode::Status,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert!(status.contains("\u{1f914} Thinking..."), "{status}");
+        assert!(status.contains("the answer"), "{status}");
+        assert!(
+            !status.contains("the raw reasoning"),
+            "status must never render the supplied reasoning text: {status}"
+        );
+
+        let off = TelegramChannel::reasoning_draft_html_for_mode(
+            StreamReasoningMode::Off,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert_eq!(off, "the answer");
+    }
+
+    #[test]
+    fn reasoning_draft_html_for_mode_keeps_the_runtime_status_line_verbatim() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let tick = zeroclaw_runtime::agent::loop_::thinking_status_text(2);
+        let html = TelegramChannel::reasoning_draft_html_for_mode(
+            StreamReasoningMode::Status,
+            &tick,
+            "the answer",
+        );
+        assert!(html.contains("Thinking (round 3)..."), "{html}");
+        assert!(html.ends_with("the answer"), "{html}");
+    }
+
+    /// Regression: a live `full` -> `status` switch kept publishing the raw
+    /// reasoning already buffered for the turn, because the renderer only
+    /// suppressed reasoning under `off`.
+    #[tokio::test]
+    async fn switching_to_status_stops_publishing_buffered_reasoning() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 77 },
+            })))
+            .mount(&server)
+            .await;
+
+        let alias = "telegram_status_switch";
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                stream_mode: StreamMode::Partial,
+                stream_reasoning: StreamReasoningMode::Full,
+                ..TelegramConfig::default()
+            },
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 1)
+        .with_persistence_authority(authority.clone())
+        .with_mock_api_base(server.uri());
+
+        ch.update_draft_with_reasoning("42", "77", "the answer", "the raw reasoning")
+            .await
+            .unwrap();
+
+        let mut updated = authority.snapshot_config();
+        updated
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias")
+            .stream_reasoning = StreamReasoningMode::Status;
+        authority.publish_for_test(updated);
+        // Spend no wall-clock time on the per-chat edit pacing.
+        ch.last_draft_edit.lock().clear();
+        ch.update_draft_with_reasoning("42", "77", "the answer", "the raw reasoning")
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let edits: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("editMessageText"))
+            .collect();
+        assert_eq!(edits.len(), 2, "one edit per mode");
+        let first: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
+        assert!(
+            first["text"]
+                .as_str()
+                .unwrap()
+                .contains("the raw reasoning")
+        );
+        let second: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
+        let text = second["text"].as_str().unwrap();
+        assert!(text.contains("\u{1f914} Thinking..."), "{text}");
+        assert!(text.contains("the answer"), "{text}");
+        assert!(
+            !text.contains("the raw reasoning"),
+            "the edit after the switch must not republish reasoning: {text}"
+        );
     }
 
     #[test]

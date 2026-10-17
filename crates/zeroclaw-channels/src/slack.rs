@@ -461,6 +461,37 @@ fn slack_reasoning_draft_text(reasoning: &str, answer: &str) -> String {
     out
 }
 
+/// Render the draft's reasoning slot under the mode resolved for this edit.
+///
+/// `full` keeps the quoted raw reasoning. `status` publishes only the liveness
+/// thinking line: the runtime's own tick when the turn already runs in status
+/// mode, otherwise the canonical first-round line. The latter matters for a
+/// live switch from `full` to `status` mid-turn — the runtime keeps emitting raw
+/// reasoning deltas for the rest of the turn, so the renderer is the boundary
+/// that must stop disclosing it.
+fn slack_reasoning_draft_text_for_mode(
+    mode: zeroclaw_config::schema::StreamReasoningMode,
+    reasoning: &str,
+    answer: &str,
+) -> String {
+    use zeroclaw_config::schema::StreamReasoningMode;
+    match mode {
+        StreamReasoningMode::Full => slack_reasoning_draft_text(reasoning, answer),
+        StreamReasoningMode::Status => {
+            // The tick carries its trailing newline; the predicate requires it.
+            let line = if zeroclaw_runtime::agent::loop_::is_thinking_status_text(reasoning) {
+                reasoning.trim_end().to_string()
+            } else {
+                zeroclaw_runtime::agent::loop_::thinking_status_text(0)
+                    .trim_end()
+                    .to_string()
+            };
+            format!("{line}\n\n{answer}")
+        }
+        StreamReasoningMode::Off => answer.to_string(),
+    }
+}
+
 /// Maximum text length for a single Slack message (approx 40k chars).
 const SLACK_MESSAGE_MAX_CHARS: usize = 40_000;
 
@@ -5640,13 +5671,14 @@ impl Channel for SlackChannel {
         answer: &str,
         reasoning: &str,
     ) -> anyhow::Result<()> {
+        let mode = self.stream_reasoning();
         if !self.stream_drafts
-            || self.stream_reasoning() == zeroclaw_config::schema::StreamReasoningMode::Off
+            || mode == zeroclaw_config::schema::StreamReasoningMode::Off
             || reasoning.trim().is_empty()
         {
             return self.update_draft(recipient, message_id, answer).await;
         }
-        let text = slack_reasoning_draft_text(reasoning, answer);
+        let text = slack_reasoning_draft_text_for_mode(mode, reasoning, answer);
         self.update_draft(recipient, message_id, &text).await
     }
 
@@ -6470,6 +6502,154 @@ mod tests {
             text.ends_with("the answer"),
             "the answer must remain the tail of the draft",
         );
+    }
+
+    #[test]
+    fn slack_reasoning_draft_text_for_mode_distinguishes_status_from_full() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let full = slack_reasoning_draft_text_for_mode(
+            StreamReasoningMode::Full,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert!(full.contains("the raw reasoning"), "{full}");
+
+        let status = slack_reasoning_draft_text_for_mode(
+            StreamReasoningMode::Status,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert!(status.contains("\u{1f914} Thinking..."), "{status}");
+        assert!(status.contains("the answer"), "{status}");
+        assert!(
+            !status.contains("the raw reasoning"),
+            "status must never render the supplied reasoning text: {status}"
+        );
+
+        let off = slack_reasoning_draft_text_for_mode(
+            StreamReasoningMode::Off,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert_eq!(off, "the answer");
+    }
+
+    #[test]
+    fn slack_reasoning_draft_text_for_mode_keeps_the_runtime_status_line_verbatim() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let tick = zeroclaw_runtime::agent::loop_::thinking_status_text(2);
+        let text =
+            slack_reasoning_draft_text_for_mode(StreamReasoningMode::Status, &tick, "the answer");
+        assert!(text.contains("Thinking (round 3)..."), "{text}");
+        assert!(text.ends_with("the answer"), "{text}");
+    }
+
+    /// Regression: a live `full` -> `status` switch kept publishing the raw
+    /// reasoning already buffered for the turn, because the renderer only
+    /// suppressed reasoning under `off`.
+    #[tokio::test]
+    async fn switching_to_status_stops_publishing_buffered_reasoning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "draft-ts",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat.update"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        // 1 = status, 2 = full; the channel resolves this per edit.
+        let published = Arc::new(AtomicUsize::new(2));
+        let resolver = Arc::clone(&published);
+        let ch = test_slack_channel(&server, tmp.path())
+            .with_streaming(true, 1)
+            .with_stream_reasoning_resolver(Arc::new(move || {
+                match resolver.load(Ordering::Relaxed) {
+                    1 => StreamReasoningMode::Status,
+                    2 => StreamReasoningMode::Full,
+                    _ => StreamReasoningMode::Off,
+                }
+            }));
+        let draft = ch
+            .send_draft(&SendMessage::new("...", "C123"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // `send_draft` records a progress update; spend no wall-clock time on
+        // the per-draft edit pacing.
+        ch.last_draft_edit
+            .lock()
+            .expect("last_draft_edit lock")
+            .clear();
+        ch.update_draft_with_reasoning("C123", &draft, "the answer", "the raw reasoning")
+            .await
+            .unwrap();
+        // The Slack edit is fire-and-forget; wait for it to reach the mock.
+        let bodies = wait_for_chat_updates(&server, 1).await;
+        assert!(
+            bodies.iter().any(|body| body.contains("the raw reasoning")),
+            "the full-mode edit must publish the reasoning: {bodies:?}"
+        );
+
+        published.store(1, Ordering::Relaxed);
+        ch.last_draft_edit
+            .lock()
+            .expect("last_draft_edit lock")
+            .clear();
+        ch.update_draft_with_reasoning("C123", &draft, "the answer", "the raw reasoning")
+            .await
+            .unwrap();
+        let bodies = wait_for_chat_updates(&server, 2).await;
+
+        let last = bodies.last().expect("a status-mode edit");
+        assert!(last.contains("\u{1f914} Thinking..."), "{last}");
+        assert!(last.contains("the answer"), "{last}");
+        assert!(
+            !last.contains("the raw reasoning"),
+            "the edit after the switch must not republish reasoning: {last}"
+        );
+    }
+
+    /// Wait (bounded) for the detached Slack edits to reach the mock server.
+    async fn wait_for_chat_updates(server: &wiremock::MockServer, expected: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let bodies: Vec<String> = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path() == "/chat.update")
+                .map(|request| String::from_utf8_lossy(&request.body).to_string())
+                .collect();
+            if bodies.len() >= expected {
+                return bodies;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/chat.update")
+            .map(|request| String::from_utf8_lossy(&request.body).to_string())
+            .collect()
     }
 
     #[test]
