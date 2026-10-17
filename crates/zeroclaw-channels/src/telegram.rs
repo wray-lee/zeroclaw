@@ -700,6 +700,18 @@ fn build_telegram_clear_reaction_request(chat_id: &str, message_id: i64) -> serd
     })
 }
 
+/// Scrub Telegram credentials from a clear-path error before it reaches a log
+/// or a tool result. The shared leak detector redacts the `/bot<token>/` URL
+/// form; the literal token is also removed because a failed response body may
+/// echo it without the surrounding URL.
+fn scrub_clear_error(text: &str, bot_token: &str) -> String {
+    let scrubbed = zeroclaw_runtime::security::scrub(text);
+    if bot_token.is_empty() {
+        return scrubbed;
+    }
+    scrubbed.replace(bot_token, "[REDACTED_BOT_TOKEN]")
+}
+
 /// Send the `setMessageReaction` clear that withdraws the bot's reaction.
 ///
 /// Bounded by `timeout` because the caller awaits it while holding the
@@ -709,17 +721,29 @@ fn build_telegram_clear_reaction_request(chat_id: &str, message_id: i64) -> serd
 async fn clear_telegram_reaction(
     client: &reqwest::Client,
     url: &str,
+    bot_token: &str,
     chat_id: &str,
     message_id: i64,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let body = build_telegram_clear_reaction_request(chat_id, message_id);
     let request = async {
-        let response = client.post(url).json(&body).send().await?;
+        // `api_url` embeds the bot token, and reqwest puts the URL in transport
+        // errors. Neither those errors nor a reflected error body may reach a
+        // log or a tool result unscrubbed: the token grants control of the bot.
+        let response = client.post(url).json(&body).send().await.map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) failed: {}",
+                scrub_clear_error(&err.without_url().to_string(), bot_token)
+            ))
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             let err_body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Telegram setMessageReaction (clear) failed ({status}): {err_body}");
+            anyhow::bail!(
+                "Telegram setMessageReaction (clear) failed ({status}): {}",
+                scrub_clear_error(&err_body, bot_token)
+            );
         }
         Ok(())
     };
@@ -3645,6 +3669,7 @@ impl TelegramChannel {
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
+        let bot_token = self.bot_token.clone();
         let emoji = random_telegram_ack_reaction().to_string();
         let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
         let clear_timeout = self.reaction_clear_timeout;
@@ -3673,8 +3698,15 @@ impl TelegramChannel {
             // when it cannot wait the add out, and returns without clearing;
             // the clear it requested is run here instead.
             if task_state.clear_requested.load(Ordering::Acquire) {
-                match clear_telegram_reaction(&client, &url, &chat_id, message_id, clear_timeout)
-                    .await
+                match clear_telegram_reaction(
+                    &client,
+                    &url,
+                    &bot_token,
+                    &chat_id,
+                    message_id,
+                    clear_timeout,
+                )
+                .await
                 {
                     Ok(()) => task_state.cleared.store(true, Ordering::Release),
                     Err(err) => {
@@ -8628,6 +8660,7 @@ Ensure only one `zeroclaw` process is using this bot token."
         clear_telegram_reaction(
             &self.http_client(),
             &self.api_url("setMessageReaction"),
+            &self.bot_token,
             &chat_id,
             numeric_message_id,
             self.reaction_clear_timeout,
@@ -9791,6 +9824,104 @@ mod tests {
             result.is_err(),
             "a deferred clear that never landed must not be reported as removed, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_scrubs_bot_token_from_a_transport_error() {
+        const TOKEN: &str = "123456:TEST-TOKEN";
+
+        // Bind and immediately drop a listener to reserve a port nothing is
+        // listening on, so the request fails before any response is read.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let channel = TelegramChannel::new(
+            TOKEN.into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_secs(2))
+        .with_mock_api_base(api_base);
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("a connection failure must surface")
+            .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_scrubs_bot_token_reflected_in_an_error_body() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "123456:TEST-TOKEN";
+        let mock_server = MockServer::start().await;
+        // A proxy or gateway can reflect the request URL - and with it the bot
+        // token - in its error body. Echo the bare token as well, which the
+        // URL-shaped leak pattern alone would not catch.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(format!(
+                "upstream failed for https://api.telegram.org/bot{TOKEN}/setMessageReaction (token {TOKEN})"
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            TOKEN.into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("an error response must surface")
+            .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
+        assert!(
+            err.contains("[REDACTED_BOT_TOKEN]"),
+            "expected the redaction marker: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_helper_error_is_scrubbed_for_the_deferred_log() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "123456:TEST-TOKEN";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string(format!("reflected token {TOKEN}")),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/bot{TOKEN}/setMessageReaction", mock_server.uri());
+        // This is the exact error the deferred ack task formats into its log
+        // record, so a scrubbed helper keeps the log clean too.
+        let err = clear_telegram_reaction(
+            &client,
+            &url,
+            TOKEN,
+            "-100200300",
+            42,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("an error response must surface")
+        .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
     }
 
     #[test]
