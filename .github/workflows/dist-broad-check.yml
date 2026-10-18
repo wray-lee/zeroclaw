@@ -2,7 +2,7 @@ name: dist-broad image check (non-publishing)
 
 on:
   push:
-    branches: [ci/dist-broad-check]
+    branches: [ci/dist-broad-check-v086]
 
 permissions:
   contents: read
