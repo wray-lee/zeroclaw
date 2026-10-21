@@ -725,6 +725,12 @@ struct PendingApproval {
 /// posted and the task that posts it, keyed by message id.
 type InboundAckEntry = (String, tokio::task::JoinHandle<()>, Instant);
 
+/// Most inbound fast-ack records kept for messages the orchestrator has not
+/// taken back yet. Above the orchestrator's pending-turn limit (100), so a
+/// message still queued behind a long turn is never evicted; only records for
+/// messages that were never handled are dropped, oldest first.
+const INBOUND_ACK_CAPACITY: usize = 256;
+
 /// Per-message inbound fast-ack state, keyed by message id.
 type InboundAckEmojis = std::sync::Mutex<std::collections::HashMap<String, InboundAckEntry>>;
 
@@ -1257,9 +1263,9 @@ impl LarkChannel {
     /// post for `message_id`, together with the task that posts it. The
     /// orchestrator takes this back before withdrawing the acknowledgement, so
     /// it removes exactly the emoji the channel added and can wait for that add
-    /// to finish during cleanup. Entries for messages the orchestrator never
-    /// handles are dropped by the same age bound used for the other per-message
-    /// caches.
+    /// to finish during cleanup. The record stays until it is taken, however
+    /// long the message waits in a queue; entries for messages the orchestrator
+    /// never handles are bounded by count ([`INBOUND_ACK_CAPACITY`]), not age.
     fn record_inbound_ack_emoji(
         &self,
         message_id: &str,
@@ -1271,7 +1277,15 @@ impl LarkChannel {
             .inbound_ack_emojis
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, (_, _, recorded)| now.duration_since(*recorded) < Duration::from_secs(300));
+        if map.len() >= INBOUND_ACK_CAPACITY
+            && !map.contains_key(message_id)
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (_, _, recorded))| *recorded)
+                .map(|(id, _)| id.clone())
+        {
+            map.remove(&oldest);
+        }
         map.insert(message_id.to_string(), (emoji.to_string(), handle, now));
     }
 
@@ -4484,6 +4498,39 @@ mod tests {
             "the entry is consumed once so a replay cannot withdraw twice"
         );
         assert!(ch.take_inbound_ack("om_missing").is_none());
+    }
+
+    // A record must survive however long its message waits in a queue: only the
+    // count bound evicts, and then the oldest record goes first.
+    #[tokio::test]
+    async fn inbound_ack_records_are_bounded_by_count_not_age() {
+        let ch = make_channel();
+        for i in 0..INBOUND_ACK_CAPACITY {
+            ch.record_inbound_ack_emoji(
+                &format!("om_{i}"),
+                "\u{23F3}",
+                zeroclaw_spawn::spawn!(async {}),
+            );
+            if i == 0 {
+                // Keep om_0 strictly the oldest record.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert!(
+            ch.take_inbound_ack("om_1").is_some(),
+            "under the bound nothing is evicted"
+        );
+        ch.record_inbound_ack_emoji("om_1", "\u{23F3}", zeroclaw_spawn::spawn!(async {}));
+        ch.record_inbound_ack_emoji("om_new", "\u{1F440}", zeroclaw_spawn::spawn!(async {}));
+        assert!(
+            ch.take_inbound_ack("om_0").is_none(),
+            "the oldest record is evicted first"
+        );
+        assert!(ch.take_inbound_ack("om_2").is_some());
+        assert_eq!(
+            ch.take_inbound_ack("om_new").expect("newest kept").emoji,
+            "\u{1F440}"
+        );
     }
 
     // Taking the recorded acknowledgement must never wait for the channel's own
