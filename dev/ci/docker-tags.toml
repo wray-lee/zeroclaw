@@ -32,7 +32,7 @@ features = "acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-
 
 [[tags]]
 stem = "dist-broad"
-pinned_tag = "dist-broad-v0.8.6"
+pinned_tag = "dist-broad-v0.8.7"
 floating_tag = "dist-broad"
 dockerfile = "Dockerfile"
 platforms = "linux/amd64,linux/arm64"
