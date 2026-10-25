@@ -27901,7 +27901,15 @@ fn prune_empty_leaves(value: &mut toml::Value) {
                 let drop = match t.get(&key) {
                     Some(toml::Value::Array(arr)) => arr.is_empty(),
                     Some(toml::Value::Table(inner)) => inner.is_empty(),
-                    Some(toml::Value::String(s)) => s.is_empty(),
+                    Some(toml::Value::String(s)) => {
+                        s.is_empty()
+                            && !matches!(
+                                key.as_str(),
+                                "ack_reaction_in_progress"
+                                    | "ack_reaction_done"
+                                    | "ack_reaction_error"
+                            )
+                    }
                     _ => false,
                 };
                 if drop {
@@ -47269,6 +47277,80 @@ allowed_users = []
             keys,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    async fn channel_rename_preserves_empty_ack_reaction_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for channel in ["slack", "matrix", "lark"] {
+            let section = format!("channels.{channel}");
+            let config_path = tmp.path().join(format!("{channel}.toml"));
+            std::fs::write(
+                &config_path,
+                format!("[channels.{channel}.old]\nack_reaction_done = \"\"\n"),
+            )
+            .unwrap();
+            let mut config = Config {
+                config_path: config_path.clone(),
+                loaded_from: Some(config_path),
+                ..Default::default()
+            };
+            match channel {
+                "slack" => {
+                    config.channels.slack.insert(
+                        "old".to_string(),
+                        SlackConfig {
+                            ack_reaction_in_progress: Some(String::new()),
+                            ack_reaction_done: Some(String::new()),
+                            ack_reaction_error: Some(String::new()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                "matrix" => {
+                    config.channels.matrix.insert(
+                        "old".to_string(),
+                        MatrixConfig {
+                            homeserver: "https://matrix.example".to_string(),
+                            user_id: Some("@bot:matrix.example".to_string()),
+                            ack_reaction_in_progress: Some(String::new()),
+                            ack_reaction_done: Some(String::new()),
+                            ack_reaction_error: Some(String::new()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                "lark" => {
+                    config.channels.lark.insert(
+                        "old".to_string(),
+                        LarkConfig {
+                            app_id: "cli_test".to_string(),
+                            app_secret: "test-secret".to_string(),
+                            ack_reaction_in_progress: Some(String::new()),
+                            ack_reaction_done: Some(String::new()),
+                            ack_reaction_error: Some(String::new()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                _ => unreachable!(),
+            };
+            config.rename_map_key(&section, "old", "new").unwrap();
+            config.mark_dirty(&format!("{section}.old"));
+            config.mark_dirty(&format!("{section}.new"));
+            config.save_dirty().await.unwrap();
+
+            let reloaded: Config =
+                toml::from_str(&std::fs::read_to_string(config.config_path).unwrap()).unwrap();
+            let alias = &toml::Value::try_from(reloaded).unwrap()["channels"][channel]["new"];
+            for key in [
+                "ack_reaction_in_progress",
+                "ack_reaction_done",
+                "ack_reaction_error",
+            ] {
+                assert_eq!(alias.get(key).and_then(toml::Value::as_str), Some(""));
+            }
+        }
     }
 
     #[test]
