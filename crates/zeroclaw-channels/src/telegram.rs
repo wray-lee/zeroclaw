@@ -779,12 +779,28 @@ async fn clear_telegram_reaction(
                 scrub_clear_error(&err.without_url().to_string(), bot_token)
             ))
         })?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let err_body = response.text().await.unwrap_or_default();
+        let status = response.status();
+        let body = response.text().await.map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) response read failed: {}",
+                scrub_clear_error(&err.without_url().to_string(), bot_token)
+            ))
+        })?;
+        if !status.is_success() {
             anyhow::bail!(
                 "Telegram setMessageReaction (clear) failed ({status}): {}",
-                scrub_clear_error(&err_body, bot_token)
+                scrub_clear_error(&body, bot_token)
+            );
+        }
+        let result: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) returned invalid JSON: {err}"
+            ))
+        })?;
+        if !result["ok"].as_bool().unwrap_or(false) {
+            anyhow::bail!(
+                "Telegram setMessageReaction (clear) rejected: {}",
+                scrub_clear_error(&body, bot_token)
             );
         }
         Ok(())
@@ -10053,6 +10069,64 @@ mod tests {
             err.contains("[REDACTED_BOT_TOKEN]"),
             "expected the redaction marker: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_rejects_telegram_api_error_in_successful_http_response() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: reaction can't be removed"
+            })))
+            .mount(&mock_server)
+            .await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("Telegram rejecting the clear must not report success")
+            .to_string();
+        assert!(err.contains("reaction can't be removed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_accepts_telegram_ok_response() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
